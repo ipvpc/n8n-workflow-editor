@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, Literal
+from urllib.parse import urlparse
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import settings_store
+from . import database, multi_config, settings_store
 from .ai_chat import ChatRequest, ai_status, run_chat
 from .n8n_client import N8nClientError, client_from_resolved
 
@@ -21,23 +24,47 @@ logger = logging.getLogger(__name__)
 _STATIC = os.path.join(os.path.dirname(__file__), "static")
 _ASSETS = os.path.join(_STATIC, "assets")
 
-app = FastAPI(title="n8n Workflow Editor", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await database.init_db()
+    yield
+    await database.close_db()
+
+
+app = FastAPI(title="n8n Workflow Editor", version="0.1.0", lifespan=lifespan)
 
 if os.path.isdir(_ASSETS):
     app.mount("/assets", StaticFiles(directory=_ASSETS), name="assets")
 
 
-def _get_client():
-    base, key = settings_store.resolved_connection()
+async def _get_client():
     try:
-        return client_from_resolved(base, key)
+        r = await multi_config.resolve_active_n8n()
+        return client_from_resolved(
+            r.base_url,
+            r.api_key,
+            http_timeout_seconds=r.http_timeout_seconds,
+            skip_tls_verify=r.skip_tls_verify,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
     except N8nClientError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "n8n-workflow-editor"}
+    return {
+        "status": "ok",
+        "service": "n8n-workflow-editor",
+        "database": multi_config.db_enabled(),
+    }
+
+
+@app.get("/api/capabilities")
+def capabilities():
+    return {"database": multi_config.db_enabled()}
 
 
 class N8nSettingsPublic(BaseModel):
@@ -45,10 +72,26 @@ class N8nSettingsPublic(BaseModel):
     api_key_masked: str | None = None
     has_api_key: bool = False
     source: str = "env"
+    instance_id: str | None = None
+    instance_name: str | None = None
 
 
 @app.get("/api/settings/n8n", response_model=N8nSettingsPublic)
-def get_n8n_settings():
+async def get_n8n_settings():
+    if multi_config.db_enabled():
+        try:
+            r = await multi_config.resolve_active_n8n()
+        except ValueError:
+            return N8nSettingsPublic(source="database")
+        return N8nSettingsPublic(
+            base_url=r.base_url,
+            api_key_masked=settings_store.mask_api_key(r.api_key),
+            has_api_key=bool(r.api_key),
+            source="database",
+            instance_id=str(r.instance_id) if r.instance_id else None,
+            instance_name=r.instance_name,
+        )
+
     f = settings_store.load_settings()
     base_env = settings_store._env_base_url()  # noqa: SLF001
     key_env = settings_store._env_api_key()  # noqa: SLF001
@@ -75,11 +118,44 @@ class PutN8nSettingsBody(BaseModel):
 
 
 @app.put("/api/settings/n8n")
-def put_n8n_settings(body: PutN8nSettingsBody):
+async def put_n8n_settings(body: PutN8nSettingsBody):
     try:
         base = settings_store.validate_base_url(body.base_url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if multi_config.db_enabled():
+        new_key = (body.api_key or "").strip()
+        try:
+            cur = await multi_config.resolve_active_n8n()
+            iid = cur.instance_id
+        except ValueError:
+            iid = None
+        if iid:
+            await multi_config.update_n8n_instance(
+                iid,
+                base_url=base,
+                api_key=new_key or None,
+            )
+            return {"ok": True, "source": "database", "instance_id": str(iid)}
+        if not new_key:
+            raise HTTPException(
+                status_code=400,
+                detail="api_key is required when no active n8n instance exists yet",
+            )
+        host = urlparse(base).netloc or "n8n"
+        nid = await multi_config.create_n8n_instance(
+            name=host,
+            base_url=base,
+            api_key=new_key,
+        )
+        prefs = await multi_config.get_preferences()
+        llm_raw = prefs.get("active_llm_profile_id")
+        await multi_config.set_preferences(
+            nid,
+            UUID(llm_raw) if llm_raw else None,
+        )
+        return {"ok": True, "source": "database", "instance_id": str(nid)}
 
     prev = settings_store.load_settings()
     new_key = (body.api_key or "").strip()
@@ -103,7 +179,16 @@ def put_n8n_settings(body: PutN8nSettingsBody):
 
 
 @app.delete("/api/settings/n8n")
-def delete_n8n_settings():
+async def delete_n8n_settings():
+    if multi_config.db_enabled():
+        prefs = await multi_config.get_preferences()
+        llm_raw = prefs.get("active_llm_profile_id")
+        await multi_config.set_preferences(
+            None,
+            UUID(llm_raw) if llm_raw else None,
+        )
+        return {"ok": True, "cleared_active_n8n": True}
+
     removed = settings_store.delete_settings_file()
     return {"ok": True, "removed_file": removed}
 
@@ -111,9 +196,11 @@ def delete_n8n_settings():
 @app.post("/api/n8n/test")
 async def test_n8n():
     try:
-        c = _get_client()
+        c = await _get_client()
         data = await c.health_ping()
         return {"ok": True, "sample": data}
+    except HTTPException:
+        raise
     except N8nClientError as e:
         raise HTTPException(status_code=502, detail={"message": str(e), "body": e.body}) from e
 
@@ -125,8 +212,10 @@ async def api_list_workflows(
     cursor: str | None = None,
 ):
     try:
-        c = _get_client()
+        c = await _get_client()
         return await c.list_workflows(active=active, limit=limit, cursor=cursor)
+    except HTTPException:
+        raise
     except N8nClientError as e:
         raise HTTPException(
             status_code=e.status_code or 502,
@@ -137,8 +226,10 @@ async def api_list_workflows(
 @app.get("/api/workflows/{workflow_id}")
 async def api_get_workflow(workflow_id: str):
     try:
-        c = _get_client()
+        c = await _get_client()
         return await c.get_workflow(workflow_id)
+    except HTTPException:
+        raise
     except N8nClientError as e:
         raise HTTPException(
             status_code=e.status_code or 502,
@@ -149,8 +240,10 @@ async def api_get_workflow(workflow_id: str):
 @app.post("/api/workflows")
 async def api_create_workflow(body: dict[str, Any]):
     try:
-        c = _get_client()
+        c = await _get_client()
         return await c.create_workflow(body)
+    except HTTPException:
+        raise
     except N8nClientError as e:
         raise HTTPException(
             status_code=e.status_code or 502,
@@ -161,8 +254,10 @@ async def api_create_workflow(body: dict[str, Any]):
 @app.patch("/api/workflows/{workflow_id}")
 async def api_patch_workflow(workflow_id: str, body: dict[str, Any]):
     try:
-        c = _get_client()
+        c = await _get_client()
         return await c.update_workflow(workflow_id, body)
+    except HTTPException:
+        raise
     except N8nClientError as e:
         raise HTTPException(
             status_code=e.status_code or 502,
@@ -173,8 +268,10 @@ async def api_patch_workflow(workflow_id: str, body: dict[str, Any]):
 @app.delete("/api/workflows/{workflow_id}")
 async def api_delete_workflow(workflow_id: str):
     try:
-        c = _get_client()
+        c = await _get_client()
         return await c.delete_workflow(workflow_id)
+    except HTTPException:
+        raise
     except N8nClientError as e:
         raise HTTPException(
             status_code=e.status_code or 502,
@@ -183,8 +280,8 @@ async def api_delete_workflow(workflow_id: str):
 
 
 @app.get("/api/ai/status")
-def api_ai_status():
-    return ai_status()
+async def api_ai_status():
+    return await ai_status()
 
 
 @app.post("/api/chat")
@@ -196,6 +293,155 @@ async def api_chat(req: ChatRequest):
     except Exception as e:
         logger.exception("chat failed")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# --- PostgreSQL-backed multi-instance / multi-LLM ---
+
+
+def _require_db():
+    if not multi_config.db_enabled():
+        raise HTTPException(status_code=501, detail="DATABASE_URL is not configured")
+
+
+class N8nInstanceCreateBody(BaseModel):
+    name: str
+    base_url: str
+    api_key: str
+    http_timeout_seconds: float = Field(default=60, ge=1, le=600)
+    skip_tls_verify: bool = False
+
+
+class N8nInstancePatchBody(BaseModel):
+    name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    http_timeout_seconds: float | None = Field(default=None, ge=1, le=600)
+    skip_tls_verify: bool | None = None
+
+
+@app.get("/api/n8n-instances")
+async def api_list_n8n_instances():
+    _require_db()
+    return await multi_config.list_n8n_instances()
+
+
+@app.post("/api/n8n-instances")
+async def api_create_n8n_instance(body: N8nInstanceCreateBody):
+    _require_db()
+    try:
+        nid = await multi_config.create_n8n_instance(
+            name=body.name,
+            base_url=body.base_url,
+            api_key=body.api_key,
+            http_timeout_seconds=body.http_timeout_seconds,
+            skip_tls_verify=body.skip_tls_verify,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "id": str(nid)}
+
+
+@app.patch("/api/n8n-instances/{instance_id}")
+async def api_patch_n8n_instance(instance_id: UUID, body: N8nInstancePatchBody):
+    _require_db()
+    try:
+        ok = await multi_config.update_n8n_instance(
+            instance_id,
+            name=body.name,
+            base_url=body.base_url,
+            api_key=body.api_key,
+            http_timeout_seconds=body.http_timeout_seconds,
+            skip_tls_verify=body.skip_tls_verify,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not ok:
+        raise HTTPException(status_code=404, detail="instance not found")
+    return {"ok": True}
+
+
+@app.delete("/api/n8n-instances/{instance_id}")
+async def api_delete_n8n_instance(instance_id: UUID):
+    _require_db()
+    ok = await multi_config.delete_n8n_instance(instance_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="instance not found")
+    return {"ok": True}
+
+
+class LlmProfileCreateBody(BaseModel):
+    name: str
+    provider: Literal["azure_openai", "openai_compatible"]
+    config: dict[str, Any]
+
+
+class LlmProfilePatchBody(BaseModel):
+    name: str | None = None
+    provider: Literal["azure_openai", "openai_compatible"] | None = None
+    config: dict[str, Any] | None = None
+
+
+@app.get("/api/llm-profiles")
+async def api_list_llm_profiles():
+    _require_db()
+    return await multi_config.list_llm_profiles()
+
+
+@app.post("/api/llm-profiles")
+async def api_create_llm_profile(body: LlmProfileCreateBody):
+    _require_db()
+    try:
+        lid = await multi_config.create_llm_profile(name=body.name, provider=body.provider, config=body.config)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, "id": str(lid)}
+
+
+@app.patch("/api/llm-profiles/{profile_id}")
+async def api_patch_llm_profile(profile_id: UUID, body: LlmProfilePatchBody):
+    _require_db()
+    try:
+        ok = await multi_config.update_llm_profile(
+            profile_id,
+            name=body.name,
+            provider=body.provider,
+            config=body.config,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not ok:
+        raise HTTPException(status_code=404, detail="profile not found")
+    return {"ok": True}
+
+
+@app.delete("/api/llm-profiles/{profile_id}")
+async def api_delete_llm_profile(profile_id: UUID):
+    _require_db()
+    ok = await multi_config.delete_llm_profile(profile_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="profile not found")
+    return {"ok": True}
+
+
+class PreferencesBody(BaseModel):
+    active_n8n_instance_id: UUID | None = None
+    active_llm_profile_id: UUID | None = None
+
+
+@app.get("/api/preferences")
+async def api_get_preferences():
+    _require_db()
+    return await multi_config.get_preferences()
+
+
+@app.put("/api/preferences")
+async def api_put_preferences(body: PreferencesBody):
+    _require_db()
+    try:
+        await multi_config.set_preferences(body.active_n8n_instance_id, body.active_llm_profile_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True}
 
 
 @app.get("/")

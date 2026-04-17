@@ -338,6 +338,83 @@ textarea:focus {
   font-size: 0.8rem;
 }
 
+.modal h3,
+.modal h4 {
+  margin: 1rem 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.modal h4 {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+select {
+  font-family: inherit;
+  font-size: 0.875rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  padding: 0.5rem 0.65rem;
+  width: 100%;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  align-items: end;
+}
+
+@media (max-width: 640px) {
+  .field-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.inline-check {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 0.75rem;
+}
+
+.inline-check input {
+  width: auto;
+}
+
+.table-like {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+}
+
+.table-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.55rem 0.65rem;
+  border-bottom: 1px solid var(--border);
+  align-items: flex-start;
+}
+
+.table-row:last-child {
+  border-bottom: none;
+}
+
+.strong {
+  font-weight: 600;
+  font-size: 0.875rem;
+}
+
+.small {
+  font-size: 0.72rem;
+}
+
 @media (max-width: 1100px) {
   .app-shell {
     grid-template-columns: 240px 1fr;

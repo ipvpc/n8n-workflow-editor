@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from . import multi_config
+from .llm_env import ai_status_from_env
 from .n8n_knowledge import N8N_KNOWLEDGE_PACK
 from .n8n_client import N8nClientError, client_from_resolved
-from .settings_store import resolved_connection
 
 logger = logging.getLogger(__name__)
 
@@ -34,59 +33,10 @@ class ChatRequest(BaseModel):
     """Optional stringified workflow JSON from the editor for context."""
 
 
-def _sanitize_endpoint(url: str) -> str:
-    u = url.strip().rstrip("/")
-    while True:
-        if u.startswith("https://https://"):
-            u = "https://" + u[16:]
-        elif u.startswith("http://https://"):
-            u = "https://" + u[13:]
-        else:
-            break
-    return u
-
-
-def _llm_config() -> tuple[str, dict[str, Any]]:
-    """Returns (provider, kwargs for AsyncOpenAI client)."""
-    azure_ep = _sanitize_endpoint(
-        os.environ.get("AZURE_AI_ENDPOINT", os.environ.get("AZURE_OPENAI_ENDPOINT", "")).strip()
-    )
-    azure_key = os.environ.get("AZURE_AI_API_KEY", os.environ.get("AZURE_OPENAI_API_KEY", "")).strip()
-    azure_dep = os.environ.get("AZURE_AI_DEPLOYMENT", os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")).strip()
-    api_ver = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview").strip()
-
-    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    openai_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
-
-    if azure_ep and azure_key and azure_dep:
-        return (
-            "azure_openai",
-            {
-                "azure_endpoint": azure_ep,
-                "api_key": azure_key,
-                "api_version": api_ver,
-                "azure_deployment": azure_dep,
-            },
-        )
-    if openai_key:
-        return (
-            "openai_compatible",
-            {"api_key": openai_key, "base_url": openai_base + "/"},
-        )
-    return ("none", {})
-
-
-def ai_status() -> dict[str, Any]:
-    provider, cfg = _llm_config()
-    enabled = provider != "none"
-    out: dict[str, Any] = {"enabled": enabled, "provider": provider}
-    if provider == "azure_openai":
-        ep = str(cfg.get("azure_endpoint", ""))
-        out["endpoint"] = re.sub(r"https?://([^.]+)\.", r"https://***.", ep, count=1) if ep else ""
-        out["deployment"] = cfg.get("azure_deployment", "")
-    elif provider == "openai_compatible":
-        out["base_url"] = cfg.get("base_url", "")
-    return out
+async def ai_status() -> dict[str, Any]:
+    if multi_config.db_enabled():
+        return await multi_config.ai_status_from_db()
+    return ai_status_from_env()
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -149,10 +99,15 @@ async def _run_tool(name: str, arguments: str) -> str:
     except json.JSONDecodeError as e:
         return json.dumps({"error": f"invalid tool arguments: {e}"})
 
-    base, key = resolved_connection()
     try:
-        client = client_from_resolved(base, key)
-    except N8nClientError as e:
+        r = await multi_config.resolve_active_n8n()
+        client = client_from_resolved(
+            r.base_url,
+            r.api_key,
+            http_timeout_seconds=r.http_timeout_seconds,
+            skip_tls_verify=r.skip_tls_verify,
+        )
+    except (ValueError, N8nClientError) as e:
         return json.dumps({"error": str(e)})
 
     if name == "n8n_get_workflow":
@@ -199,7 +154,6 @@ def _to_openai_messages(
 
     msgs: list[dict[str, Any]] = [{"role": "system", "content": system + extra}]
     for m in incoming:
-        # Client may only send user/assistant history; ignore other roles for safety.
         if m.role == "assistant":
             msgs.append({"role": "assistant", "content": m.content or ""})
         elif m.role == "user":
@@ -211,31 +165,31 @@ async def run_chat(req: ChatRequest) -> dict[str, Any]:
     if not req.messages:
         raise RuntimeError("messages must not be empty")
 
-    provider, cfg = _llm_config()
-    if provider == "none":
+    llm = await multi_config.resolve_active_llm()
+    if not llm:
         raise RuntimeError(
-            "AI is not configured. Set AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY + AZURE_OPENAI_DEPLOYMENT "
-            "or OPENAI_API_KEY (optional OPENAI_BASE_URL)."
+            "AI is not configured. With PostgreSQL enabled, create an LLM profile and set it active. "
+            "Otherwise set AZURE_OPENAI_* or OPENAI_API_KEY in the environment."
         )
 
     from openai import AsyncAzureOpenAI, AsyncOpenAI
 
-    if provider == "azure_openai":
+    if llm.provider == "azure_openai":
         client: Any = AsyncAzureOpenAI(
-            azure_endpoint=str(cfg["azure_endpoint"]),
-            api_key=str(cfg["api_key"]),
-            api_version=str(cfg["api_version"]),
+            azure_endpoint=str(llm.azure_endpoint),
+            api_key=str(llm.api_key),
+            api_version=str(llm.api_version or "2024-08-01-preview"),
         )
-        model = str(cfg["azure_deployment"])
+        model = str(llm.azure_deployment)
     else:
-        client = AsyncOpenAI(api_key=str(cfg["api_key"]), base_url=str(cfg["base_url"]))
-        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+        client = AsyncOpenAI(api_key=str(llm.api_key), base_url=str(llm.base_url))
+        model = str(llm.model or "gpt-4o-mini")
 
     system = _system_prompt()
     messages = _to_openai_messages(system, req.messages, req.workflow_id, req.workflow_json)
 
-    temperature = float(os.environ.get("N8N_EDITOR_AI_TEMPERATURE", "0.2"))
-    max_tokens = int(os.environ.get("N8N_EDITOR_AI_MAX_TOKENS", "4096"))
+    temperature = float(llm.temperature)
+    max_tokens = int(llm.max_tokens)
 
     rounds = 0
     last_assistant_text = ""
@@ -268,7 +222,7 @@ async def run_chat(req: ChatRequest) -> dict[str, Any]:
         if not tool_calls:
             return {
                 "answer_markdown": assistant_content,
-                "provider": provider,
+                "provider": llm.provider,
                 "model": model,
                 "finish_reason": choice.finish_reason,
             }
@@ -304,7 +258,7 @@ async def run_chat(req: ChatRequest) -> dict[str, Any]:
 
     return {
         "answer_markdown": last_assistant_text or "Tool loop limit reached.",
-        "provider": provider,
+        "provider": llm.provider,
         "model": model,
         "finish_reason": "tool_loop_limit",
     }

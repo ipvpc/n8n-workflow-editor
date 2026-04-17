@@ -30,11 +30,20 @@ class N8nClientError(Exception):
 
 
 class N8nClient:
-    def __init__(self, base_url: str, api_key: str):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        http_timeout_seconds: float | None = None,
+        skip_tls_verify: bool | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key.strip()
-        self._verify = not _skip_tls_verify()
-        self._timeout = httpx.Timeout(_timeout_seconds())
+        verify = not (_skip_tls_verify() if skip_tls_verify is None else skip_tls_verify)
+        self._verify = verify
+        to = _timeout_seconds() if http_timeout_seconds is None else float(http_timeout_seconds)
+        self._timeout = httpx.Timeout(to)
 
     def _headers(self, content_json: bool) -> dict[str, str]:
         h = {
@@ -119,7 +128,18 @@ class N8nClient:
         return await self._request("DELETE", f"/workflows/{workflow_id}")
 
 
-def client_from_resolved(base_url: str, api_key: str) -> N8nClient:
+def client_from_resolved(
+    base_url: str,
+    api_key: str,
+    *,
+    http_timeout_seconds: float | None = None,
+    skip_tls_verify: bool | None = None,
+) -> N8nClient:
     if not base_url or not api_key:
         raise N8nClientError("n8n base URL and API key must be configured")
-    return N8nClient(base_url, api_key)
+    return N8nClient(
+        base_url,
+        api_key,
+        http_timeout_seconds=http_timeout_seconds,
+        skip_tls_verify=skip_tls_verify,
+    )

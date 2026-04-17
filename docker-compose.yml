@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: n8n_editor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-n8n_editor}
+      POSTGRES_DB: n8n_editor
+    volumes:
+      - n8n_workflow_editor_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n_editor -d n8n_editor"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  n8n-workflow-editor:
+    build: .
+    image: n8n-workflow-editor:local
+    ports:
+      - "${N8N_WORKFLOW_EDITOR_PORT:-8105}:8105"
+    environment:
+      DATABASE_URL: postgresql://n8n_editor:${POSTGRES_PASSWORD:-n8n_editor}@postgres:5432/n8n_editor
+      N8N_WORKFLOW_EDITOR_DATA_DIR: /data
+      N8N_WORKFLOW_EDITOR_LOG_LEVEL: ${N8N_WORKFLOW_EDITOR_LOG_LEVEL:-INFO}
+      N8N_BASE_URL: ${N8N_BASE_URL:-}
+      N8N_API_KEY: ${N8N_API_KEY:-}
+      N8N_HTTP_TIMEOUT_SECONDS: ${N8N_HTTP_TIMEOUT_SECONDS:-60}
+      N8N_SKIP_TLS_VERIFY: ${N8N_SKIP_TLS_VERIFY:-false}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-08-01-preview}
+      AZURE_AI_ENDPOINT: ${AZURE_AI_ENDPOINT:-}
+      AZURE_AI_API_KEY: ${AZURE_AI_API_KEY:-}
+      AZURE_AI_DEPLOYMENT: ${AZURE_AI_DEPLOYMENT:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      N8N_EDITOR_AI_TEMPERATURE: ${N8N_EDITOR_AI_TEMPERATURE:-0.2}
+      N8N_EDITOR_AI_MAX_TOKENS: ${N8N_EDITOR_AI_MAX_TOKENS:-4096}
+    volumes:
+      - n8n_workflow_editor_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  n8n_workflow_editor_data:
+  n8n_workflow_editor_pg:
