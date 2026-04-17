@@ -1,18 +1,4 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: n8n_editor
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-n8n_editor}
-      POSTGRES_DB: n8n_editor
-    volumes:
-      - n8n_workflow_editor_pg:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U n8n_editor -d n8n_editor"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
 
   n8n-workflow-editor:
     build: .
