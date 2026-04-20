@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+_SHARED_CLIENTS: dict[tuple[bool, float], httpx.AsyncClient] = {}
 
 
 def _skip_tls_verify() -> bool:
@@ -43,6 +44,7 @@ class N8nClient:
         verify = not (_skip_tls_verify() if skip_tls_verify is None else skip_tls_verify)
         self._verify = verify
         to = _timeout_seconds() if http_timeout_seconds is None else float(http_timeout_seconds)
+        self._timeout_seconds = to
         self._timeout = httpx.Timeout(to)
 
     def _headers(self, content_json: bool) -> dict[str, str]:
@@ -57,6 +59,14 @@ class N8nClient:
     def _api_root(self) -> str:
         return f"{self.base_url}/api/v1"
 
+    def _shared_client(self) -> httpx.AsyncClient:
+        key = (self._verify, self._timeout_seconds)
+        client = _SHARED_CLIENTS.get(key)
+        if client is None:
+            client = httpx.AsyncClient(verify=self._verify, timeout=self._timeout)
+            _SHARED_CLIENTS[key] = client
+        return client
+
     async def _request(
         self,
         method: str,
@@ -67,17 +77,17 @@ class N8nClient:
     ) -> Any:
         url = f"{self._api_root()}{path}"
         content_json = json_body is not None
-        async with httpx.AsyncClient(verify=self._verify, timeout=self._timeout) as client:
-            try:
-                r = await client.request(
-                    method,
-                    url,
-                    params=params,
-                    json=json_body,
-                    headers=self._headers(content_json),
-                )
-            except httpx.RequestError as e:
-                raise N8nClientError(f"n8n request failed: {e}") from e
+        client = self._shared_client()
+        try:
+            r = await client.request(
+                method,
+                url,
+                params=params,
+                json=json_body,
+                headers=self._headers(content_json),
+            )
+        except httpx.RequestError as e:
+            raise N8nClientError(f"n8n request failed: {e}") from e
 
         text = r.text
         if r.status_code >= 400:
@@ -143,3 +153,13 @@ def client_from_resolved(
         http_timeout_seconds=http_timeout_seconds,
         skip_tls_verify=skip_tls_verify,
     )
+
+
+async def close_shared_clients() -> None:
+    clients = list(_SHARED_CLIENTS.values())
+    _SHARED_CLIENTS.clear()
+    for c in clients:
+        try:
+            await c.aclose()
+        except Exception:
+            logger.exception("failed to close shared n8n http client")

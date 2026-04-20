@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import os
 import re
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -121,4 +124,60 @@ def validate_base_url(url: str) -> str:
         raise ValueError("base_url is required")
     if not re.match(r"^https?://", u, re.I):
         raise ValueError("base_url must start with http:// or https://")
+    parsed = urlparse(u)
+    host = parsed.hostname
+    if not host:
+        raise ValueError("base_url must include a valid host")
+    if not _allow_private_network_targets() and _host_is_private_or_local(host):
+        raise ValueError("base_url host resolves to private/local network addresses, which is not allowed")
     return u
+
+
+def _allow_private_network_targets() -> bool:
+    return os.environ.get("N8N_ALLOW_PRIVATE_NETWORK_TARGETS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _host_is_private_or_local(host: str) -> bool:
+    h = host.strip().lower()
+    if h in {"localhost", "localhost.localdomain"}:
+        return True
+
+    try:
+        return _ip_is_private_or_local(ipaddress.ip_address(h))
+    except ValueError:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        # If DNS fails, let the downstream request fail with a clear request error.
+        return False
+
+    for info in infos:
+        sockaddr = info[4]
+        ip_raw = sockaddr[0] if isinstance(sockaddr, tuple) and sockaddr else ""
+        if not ip_raw:
+            continue
+        try:
+            if _ip_is_private_or_local(ipaddress.ip_address(ip_raw)):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _ip_is_private_or_local(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return any(
+        (
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )
+    )

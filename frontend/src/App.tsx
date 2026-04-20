@@ -1,6 +1,7 @@
 import Editor from "@monaco-editor/react";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChatPanel } from "./components/ChatPanel";
+import { WorkflowSidebar } from "./components/WorkflowSidebar";
 
 type WorkflowRow = {
   id: string;
@@ -71,6 +72,36 @@ function extractJsonFromMarkdown(md: string): string | null {
   return null;
 }
 
+async function parseApiError(r: Response): Promise<string> {
+  const fallback = `${r.status} ${r.statusText || "Request failed"}`.trim();
+  const body = (await r.json().catch(() => ({}))) as { detail?: unknown; message?: unknown };
+  if (typeof body.detail === "string") return body.detail;
+  if (body.detail && typeof body.detail === "object") return JSON.stringify(body.detail);
+  if (typeof body.message === "string") return body.message;
+  return fallback;
+}
+
+function authHeader(): Record<string, string> {
+  const token = window.localStorage.getItem("n8n_editor_auth_token")?.trim();
+  if (!token) return {};
+  return { Authorization: `Bearer ${token}` };
+}
+
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers ?? {});
+  for (const [k, v] of Object.entries(authHeader())) headers.set(k, v);
+  let r: Response;
+  try {
+    r = await fetch(url, { ...init, headers });
+  } catch (e) {
+    throw new Error(`Network error: ${String(e)}`);
+  }
+  if (!r.ok) {
+    throw new Error(await parseApiError(r));
+  }
+  return (await r.json()) as T;
+}
+
 export default function App() {
   const [dbMode, setDbMode] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -109,54 +140,62 @@ export default function App() {
   const [chat, setChat] = useState<ChatTurn[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
+  const [loadingWorkflowId, setLoadingWorkflowId] = useState<string | null>(null);
+  const [savingWorkflow, setSavingWorkflow] = useState(false);
+  const workflowLoadSeq = useRef(0);
 
   const loadCapabilities = useCallback(async () => {
-    const r = await fetch("/api/capabilities");
-    if (!r.ok) return;
-    const j = (await r.json()) as { database?: boolean };
-    setDbMode(!!j.database);
+    try {
+      const j = await requestJson<{ database?: boolean }>("/api/capabilities");
+      setDbMode(!!j.database);
+    } catch {
+      setDbMode(false);
+    }
   }, []);
 
   const loadSettings = useCallback(async () => {
-    const r = await fetch("/api/settings/n8n");
-    if (!r.ok) return;
-    const j = (await r.json()) as SettingsMeta;
-    setSettingsMeta(j);
-    if (j.base_url) setBaseUrlInput(j.base_url);
+    try {
+      const j = await requestJson<SettingsMeta>("/api/settings/n8n");
+      setSettingsMeta(j);
+      if (j.base_url) setBaseUrlInput(j.base_url);
+    } catch {
+      // Keep existing values when settings load fails.
+    }
   }, []);
 
   const loadDbBundle = useCallback(async () => {
-    const [i, p, pr] = await Promise.all([
-      fetch("/api/n8n-instances"),
-      fetch("/api/llm-profiles"),
-      fetch("/api/preferences"),
-    ]);
-    if (i.ok) setInstances((await i.json()) as N8nInstanceRow[]);
-    if (p.ok) setProfiles((await p.json()) as LlmProfileRow[]);
-    if (pr.ok) setPrefs((await pr.json()) as Preferences);
+    try {
+      const [i, p, pr] = await Promise.all([
+        requestJson<N8nInstanceRow[]>("/api/n8n-instances"),
+        requestJson<LlmProfileRow[]>("/api/llm-profiles"),
+        requestJson<Preferences>("/api/preferences"),
+      ]);
+      setInstances(i);
+      setProfiles(p);
+      setPrefs(pr);
+    } catch (e) {
+      setStatusMsg(`Failed to load DB settings: ${String(e)}`);
+    }
   }, []);
 
   const loadAiStatus = useCallback(async () => {
-    const r = await fetch("/api/ai/status");
-    if (!r.ok) {
+    try {
+      const j = await requestJson<{ enabled?: boolean }>("/api/ai/status");
+      setAiOk(!!j.enabled);
+    } catch {
       setAiOk(false);
-      return;
     }
-    const j = (await r.json()) as { enabled?: boolean };
-    setAiOk(!!j.enabled);
   }, []);
 
   const refreshWorkflows = useCallback(async () => {
     setStatusMsg(null);
-    const r = await fetch("/api/workflows?limit=200");
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      setStatusMsg(typeof err?.detail === "object" ? JSON.stringify(err.detail) : r.statusText);
+    try {
+      const j = await requestJson<unknown>("/api/workflows?limit=200");
+      setWorkflows(workflowsFromResponse(j));
+    } catch (e) {
+      setStatusMsg(String(e));
       setWorkflows([]);
-      return;
     }
-    const j = await r.json();
-    setWorkflows(workflowsFromResponse(j));
   }, []);
 
   useEffect(() => {
@@ -173,52 +212,69 @@ export default function App() {
     if (settingsOpen && dbMode) void loadDbBundle();
   }, [settingsOpen, dbMode, loadDbBundle]);
 
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!dirty) return;
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [dirty]);
+
   const normId = (s: string | null | undefined) => (s && s.length ? s : null);
 
   const applyPreferences = useCallback(
     async (next: Preferences) => {
       setStatusMsg(null);
-      const r = await fetch("/api/preferences", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      try {
+        await requestJson<{ ok: boolean }>("/api/preferences", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            active_n8n_instance_id: normId(next.active_n8n_instance_id ?? undefined),
+            active_llm_profile_id: normId(next.active_llm_profile_id ?? undefined),
+          }),
+        });
+        setPrefs({
           active_n8n_instance_id: normId(next.active_n8n_instance_id ?? undefined),
           active_llm_profile_id: normId(next.active_llm_profile_id ?? undefined),
-        }),
-      });
-      if (!r.ok) {
-        const err = await r.json().catch(() => ({}));
-        setStatusMsg(typeof err?.detail === "string" ? err.detail : JSON.stringify(err));
-        return;
+        });
+        await loadSettings();
+        await loadAiStatus();
+        await refreshWorkflows();
+        setStatusMsg("Active targets updated.");
+      } catch (e) {
+        setStatusMsg(String(e));
       }
-      setPrefs({
-        active_n8n_instance_id: normId(next.active_n8n_instance_id ?? undefined),
-        active_llm_profile_id: normId(next.active_llm_profile_id ?? undefined),
-      });
-      await loadSettings();
-      await loadAiStatus();
-      await refreshWorkflows();
-      setStatusMsg("Active targets updated.");
     },
     [loadSettings, loadAiStatus, refreshWorkflows],
   );
 
   const loadWorkflow = useCallback(async (id: string) => {
-    setStatusMsg(null);
-    const r = await fetch(`/api/workflows/${encodeURIComponent(id)}`);
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      setStatusMsg(typeof err?.detail === "object" ? JSON.stringify(err.detail) : r.statusText);
-      return;
+    if (dirty && selectedId && selectedId !== id) {
+      const proceed = window.confirm("You have unsaved changes. Load another workflow and discard changes?");
+      if (!proceed) return;
     }
-    const data = await r.json();
-    setEditorText(JSON.stringify(data, null, 2));
-    setSelectedId(id);
-    setDirty(false);
-  }, []);
+    setStatusMsg(null);
+    const seq = ++workflowLoadSeq.current;
+    setLoadingWorkflowId(id);
+    try {
+      const data = await requestJson<unknown>(`/api/workflows/${encodeURIComponent(id)}`);
+      if (seq !== workflowLoadSeq.current) return;
+      setEditorText(JSON.stringify(data, null, 2));
+      setSelectedId(id);
+      setDirty(false);
+    } catch (e) {
+      if (seq !== workflowLoadSeq.current) return;
+      setStatusMsg(String(e));
+    } finally {
+      if (seq === workflowLoadSeq.current) setLoadingWorkflowId(null);
+    }
+  }, [dirty, selectedId]);
 
   const saveWorkflow = useCallback(async () => {
-    if (!selectedId) return;
+    if (!selectedId || savingWorkflow) return;
     let body: object;
     try {
       body = JSON.parse(editorText) as object;
@@ -227,21 +283,22 @@ export default function App() {
       return;
     }
     setStatusMsg(null);
-    const r = await fetch(`/api/workflows/${encodeURIComponent(selectedId)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      setStatusMsg(typeof err?.detail === "object" ? JSON.stringify(err.detail) : r.statusText);
-      return;
+    setSavingWorkflow(true);
+    try {
+      const data = await requestJson<unknown>(`/api/workflows/${encodeURIComponent(selectedId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      setEditorText(JSON.stringify(data, null, 2));
+      setDirty(false);
+      setStatusMsg("Saved.");
+    } catch (e) {
+      setStatusMsg(String(e));
+    } finally {
+      setSavingWorkflow(false);
     }
-    const data = await r.json();
-    setEditorText(JSON.stringify(data, null, 2));
-    setDirty(false);
-    setStatusMsg("Saved.");
-  }, [editorText, selectedId]);
+  }, [editorText, savingWorkflow, selectedId]);
 
   const onFormat = useCallback(() => {
     try {
@@ -254,13 +311,12 @@ export default function App() {
 
   const testConnection = useCallback(async () => {
     setStatusMsg(null);
-    const r = await fetch("/api/n8n/test", { method: "POST" });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      setStatusMsg(typeof err?.detail === "object" ? JSON.stringify(err.detail) : r.statusText);
-      return;
+    try {
+      await requestJson<{ ok: boolean }>("/api/n8n/test", { method: "POST" });
+      setStatusMsg("n8n connection OK.");
+    } catch (e) {
+      setStatusMsg(String(e));
     }
-    setStatusMsg("n8n connection OK.");
   }, []);
 
   const saveSettings = useCallback(async () => {
@@ -268,62 +324,60 @@ export default function App() {
     const payload: { base_url: string; api_key?: string } = { base_url: baseUrlInput.trim() };
     const k = apiKeyInput.trim();
     if (k) payload.api_key = k;
-    const r = await fetch("/api/settings/n8n", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      setStatusMsg(typeof err?.detail === "string" ? err.detail : JSON.stringify(err));
-      return;
+    try {
+      await requestJson<{ ok: boolean }>("/api/settings/n8n", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setApiKeyInput("");
+      setSettingsOpen(false);
+      await loadSettings();
+      await refreshWorkflows();
+      setStatusMsg("Settings saved.");
+    } catch (e) {
+      setStatusMsg(String(e));
     }
-    setApiKeyInput("");
-    setSettingsOpen(false);
-    await loadSettings();
-    await refreshWorkflows();
-    setStatusMsg("Settings saved.");
   }, [apiKeyInput, baseUrlInput, loadSettings, refreshWorkflows]);
 
   const addN8nInstance = useCallback(async () => {
     setStatusMsg(null);
-    const r = await fetch("/api/n8n-instances", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: newN8nName.trim() || "Unnamed",
-        base_url: newN8nBase.trim(),
-        api_key: newN8nKey.trim(),
-        http_timeout_seconds: newN8nTimeout,
-        skip_tls_verify: newN8nSkipTls,
-      }),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      setStatusMsg(typeof err?.detail === "string" ? err.detail : JSON.stringify(err));
-      return;
+    try {
+      await requestJson<{ ok: boolean }>("/api/n8n-instances", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: newN8nName.trim() || "Unnamed",
+          base_url: newN8nBase.trim(),
+          api_key: newN8nKey.trim(),
+          http_timeout_seconds: newN8nTimeout,
+          skip_tls_verify: newN8nSkipTls,
+        }),
+      });
+      setNewN8nName("");
+      setNewN8nBase("");
+      setNewN8nKey("");
+      setNewN8nTimeout(60);
+      setNewN8nSkipTls(false);
+      await loadDbBundle();
+      setStatusMsg("n8n remote added.");
+    } catch (e) {
+      setStatusMsg(String(e));
     }
-    setNewN8nName("");
-    setNewN8nBase("");
-    setNewN8nKey("");
-    setNewN8nTimeout(60);
-    setNewN8nSkipTls(false);
-    await loadDbBundle();
-    setStatusMsg("n8n remote added.");
   }, [newN8nBase, newN8nKey, newN8nName, newN8nSkipTls, newN8nTimeout, loadDbBundle]);
 
   const removeN8nInstance = useCallback(
     async (id: string) => {
       if (!confirm("Delete this n8n remote?")) return;
       setStatusMsg(null);
-      const r = await fetch(`/api/n8n-instances/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!r.ok) {
-        setStatusMsg("Delete failed.");
-        return;
+      try {
+        await requestJson<{ ok: boolean }>(`/api/n8n-instances/${encodeURIComponent(id)}`, { method: "DELETE" });
+        await loadDbBundle();
+        await loadSettings();
+        setStatusMsg("Remote removed.");
+      } catch (e) {
+        setStatusMsg(String(e));
       }
-      await loadDbBundle();
-      await loadSettings();
-      setStatusMsg("Remote removed.");
     },
     [loadDbBundle, loadSettings],
   );
@@ -343,42 +397,41 @@ export default function App() {
             base_url: oaiBase.trim() || "https://api.openai.com/v1",
             model: oaiModel.trim() || "gpt-4o-mini",
           };
-    const r = await fetch("/api/llm-profiles", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: newLlmName.trim() || "Unnamed",
-        provider: newLlmProvider,
-        config,
-      }),
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      setStatusMsg(typeof err?.detail === "string" ? err.detail : JSON.stringify(err));
-      return;
+    try {
+      await requestJson<{ ok: boolean }>("/api/llm-profiles", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: newLlmName.trim() || "Unnamed",
+          provider: newLlmProvider,
+          config,
+        }),
+      });
+      setNewLlmName("");
+      setAzureEp("");
+      setAzureKey("");
+      setAzureDep("");
+      setOaiKey("");
+      await loadDbBundle();
+      await loadAiStatus();
+      setStatusMsg("LLM profile added.");
+    } catch (e) {
+      setStatusMsg(String(e));
     }
-    setNewLlmName("");
-    setAzureEp("");
-    setAzureKey("");
-    setAzureDep("");
-    setOaiKey("");
-    await loadDbBundle();
-    await loadAiStatus();
-    setStatusMsg("LLM profile added.");
   }, [azureDep, azureEp, azureKey, azureVer, loadAiStatus, loadDbBundle, newLlmName, newLlmProvider, oaiBase, oaiKey, oaiModel]);
 
   const removeLlmProfile = useCallback(
     async (id: string) => {
       if (!confirm("Delete this LLM profile?")) return;
       setStatusMsg(null);
-      const r = await fetch(`/api/llm-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!r.ok) {
-        setStatusMsg("Delete failed.");
-        return;
+      try {
+        await requestJson<{ ok: boolean }>(`/api/llm-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
+        await loadDbBundle();
+        await loadAiStatus();
+        setStatusMsg("Profile removed.");
+      } catch (e) {
+        setStatusMsg(String(e));
       }
-      await loadDbBundle();
-      await loadAiStatus();
-      setStatusMsg("Profile removed.");
     },
     [loadAiStatus, loadDbBundle],
   );
@@ -475,47 +528,25 @@ export default function App() {
         </div>
       </header>
 
-      <aside className="sidebar">
-        <div className="sidebar-header">
-          <div className="search">
-            <input
-              placeholder="Search workflows…"
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-            />
-          </div>
-          {sidebarHint && <div className="muted">{sidebarHint}</div>}
-        </div>
-        <div className="workflow-list">
-          {filtered.map((w) => (
-            <div
-              key={w.id}
-              className={`workflow-item ${selectedId === w.id ? "active" : ""}`}
-              onClick={() => void loadWorkflow(w.id)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  void loadWorkflow(w.id);
-                }
-              }}
-              role="button"
-              tabIndex={0}
-            >
-              <div className="name">{w.name ?? "(unnamed)"}</div>
-              <div className="meta">
-                {w.id}
-                {w.active === false ? " · inactive" : ""}
-              </div>
-            </div>
-          ))}
-          {filtered.length === 0 && <div className="muted" style={{ padding: "0.5rem" }}>No workflows.</div>}
-        </div>
-      </aside>
+      <WorkflowSidebar
+        filter={filter}
+        onFilterChange={setFilter}
+        sidebarHint={sidebarHint}
+        workflows={filtered}
+        selectedId={selectedId}
+        loadingWorkflowId={loadingWorkflowId}
+        onSelectWorkflow={(id) => void loadWorkflow(id)}
+      />
 
       <section className="editor-panel">
         <div className="editor-toolbar">
           <div className="title">{editorTitle}</div>
-          <button type="button" className="primary" disabled={!selectedId || !dirty} onClick={() => void saveWorkflow()}>
+          <button
+            type="button"
+            className="primary"
+            disabled={!selectedId || !dirty || savingWorkflow}
+            onClick={() => void saveWorkflow()}
+          >
             Save to n8n
           </button>
           <button type="button" className="ghost" onClick={onFormat}>
@@ -543,47 +574,15 @@ export default function App() {
         </div>
       </section>
 
-      <aside className="chat-panel">
-        <div className="chat-header">Assistant</div>
-        <div className="chat-messages">
-          {chat.length === 0 && (
-            <div className="muted">Ask about nodes, expressions, or edits. The current editor JSON is sent as context.</div>
-          )}
-          {chat.map((m, i) => (
-            <div key={i} className={`msg ${m.role}`}>
-              {m.role === "assistant" ? (
-                <ReactMarkdown>{m.content}</ReactMarkdown>
-              ) : (
-                m.content
-              )}
-            </div>
-          ))}
-        </div>
-        <div className="chat-input-row">
-          <textarea
-            placeholder="Message…"
-            value={chatInput}
-            onChange={(e) => setChatInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                void sendChat();
-              }
-            }}
-          />
-          <button type="button" className="primary" disabled={chatBusy} onClick={() => void sendChat()}>
-            Send
-          </button>
-        </div>
-        <div style={{ padding: "0 0.65rem 0.65rem", display: "flex", gap: "0.5rem" }}>
-          <button type="button" className="ghost" onClick={applyJsonFromLastAssistant}>
-            Apply JSON from last reply
-          </button>
-          <button type="button" className="ghost" onClick={() => setChat([])}>
-            Clear chat
-          </button>
-        </div>
-      </aside>
+      <ChatPanel
+        chat={chat}
+        chatInput={chatInput}
+        chatBusy={chatBusy}
+        onChatInputChange={setChatInput}
+        onSend={() => void sendChat()}
+        onApplyJson={applyJsonFromLastAssistant}
+        onClear={() => setChat([])}
+      />
 
       {settingsOpen && (
         <div className="modal-backdrop" role="presentation" onClick={() => setSettingsOpen(false)}>

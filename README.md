@@ -14,6 +14,14 @@ Persisted settings (optional UI overrides for env defaults) live in the named vo
 
 ## Configuration
 
+### API authentication and runtime safety
+
+- `N8N_EDITOR_REQUIRE_AUTH` (default `false` in development) — when `true`, all `/api/*` routes require `Authorization: Bearer <token>`.
+- `N8N_EDITOR_AUTH_TOKEN` — required when API auth is enabled.
+- `N8N_WORKFLOW_EDITOR_ENV` — set to `production` to enable stricter safety checks.
+- `N8N_ALLOW_PRIVATE_NETWORK_TARGETS` (default `false`) — allow `N8N_BASE_URL` hosts that resolve to private/local addresses.
+- Browser UI reads the bearer token from `localStorage["n8n_editor_auth_token"]` and sends it automatically.
+
 ### n8n connection
 
 - `N8N_BASE_URL` — Root URL of your n8n instance, e.g. `https://n8n.example.com` (no trailing slash required).
@@ -23,6 +31,7 @@ You can also set connection details in the **Settings** dialog in the UI; saved 
 
 - `N8N_HTTP_TIMEOUT_SECONDS` (default `60`)
 - `N8N_SKIP_TLS_VERIFY` — If `true`, disables TLS verification for n8n HTTPS calls. **Unsafe**; for lab use only (default `false`).
+  In production mode, this must remain `false`.
 
 ### AI (chat)
 

@@ -20,16 +20,16 @@ MAX_TOOL_ROUNDS = 8
 
 class ChatMessageIn(BaseModel):
     role: Literal["user", "assistant", "system", "tool"]
-    content: str | None = ""
+    content: str | None = Field(default="", max_length=40_000)
     tool_call_id: str | None = None
     name: str | None = None
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessageIn] = Field(default_factory=list)
+    messages: list[ChatMessageIn] = Field(default_factory=list, max_length=80)
     workflow_id: str | None = None
     """Current workflow id in the editor (for tools and context)."""
-    workflow_json: str | None = None
+    workflow_json: str | None = Field(default=None, max_length=160_000)
     """Optional stringified workflow JSON from the editor for context."""
 
 

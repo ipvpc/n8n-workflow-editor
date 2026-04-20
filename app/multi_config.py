@@ -42,6 +42,13 @@ def db_enabled() -> bool:
     return get_pool() is not None
 
 
+def _require_pool():
+    pool = get_pool()
+    if pool is None:
+        raise RuntimeError("DATABASE_URL is not configured")
+    return pool
+
+
 def _env_timeout() -> float:
     try:
         return float(os.environ.get("N8N_HTTP_TIMEOUT_SECONDS", "60"))
@@ -51,6 +58,10 @@ def _env_timeout() -> float:
 
 def _env_skip_tls() -> bool:
     return os.environ.get("N8N_SKIP_TLS_VERIFY", "").lower() in ("1", "true", "yes")
+
+
+def _is_production() -> bool:
+    return os.environ.get("N8N_WORKFLOW_EDITOR_ENV", "").strip().lower() in ("prod", "production")
 
 
 async def resolve_active_n8n() -> ResolvedN8n:
@@ -66,6 +77,8 @@ async def resolve_active_n8n() -> ResolvedN8n:
                 """
             )
             if row and row["base_url"] and row["api_key"]:
+                if _is_production() and bool(row["skip_tls_verify"]):
+                    raise ValueError("skip_tls_verify=true is not allowed in production")
                 return ResolvedN8n(
                     str(row["base_url"]).rstrip("/"),
                     str(row["api_key"]),
@@ -77,13 +90,19 @@ async def resolve_active_n8n() -> ResolvedN8n:
         base = os.environ.get("N8N_BASE_URL", "").strip().rstrip("/")
         key = os.environ.get("N8N_API_KEY", "").strip()
         if base and key:
-            return ResolvedN8n(base, key, _env_timeout(), _env_skip_tls(), None, None)
+            skip = _env_skip_tls()
+            if _is_production() and skip:
+                raise ValueError("N8N_SKIP_TLS_VERIFY=true is not allowed in production")
+            return ResolvedN8n(base, key, _env_timeout(), skip, None, None)
         raise ValueError("No active n8n instance and N8N_BASE_URL / N8N_API_KEY are not set")
 
     base, key = settings_store.resolved_connection()
     if not base or not key:
         raise ValueError("n8n base URL and API key must be configured")
-    return ResolvedN8n(base, key, _env_timeout(), _env_skip_tls(), None, None)
+    skip = _env_skip_tls()
+    if _is_production() and skip:
+        raise ValueError("N8N_SKIP_TLS_VERIFY=true is not allowed in production")
+    return ResolvedN8n(base, key, _env_timeout(), skip, None, None)
 
 
 async def resolve_active_llm() -> ResolvedLlm | None:
@@ -179,8 +198,7 @@ def _mask_config_public(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 async def list_n8n_instances() -> list[dict[str, Any]]:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
@@ -213,8 +231,9 @@ async def create_n8n_instance(
     http_timeout_seconds: float = 60,
     skip_tls_verify: bool = False,
 ) -> UUID:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
+    if _is_production() and skip_tls_verify:
+        raise ValueError("skip_tls_verify=true is not allowed in production")
     base = settings_store.validate_base_url(base_url)
     async with pool.acquire() as conn:
         nid = await conn.fetchval(
@@ -241,8 +260,7 @@ async def update_n8n_instance(
     http_timeout_seconds: float | None = None,
     skip_tls_verify: bool | None = None,
 ) -> bool:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM n8n_instance WHERE id = $1", instance_id)
         if not row:
@@ -252,6 +270,8 @@ async def update_n8n_instance(
         ak = api_key.strip() if api_key is not None and api_key.strip() else row["api_key"]
         to = http_timeout_seconds if http_timeout_seconds is not None else float(row["http_timeout_seconds"] or 60)
         sk = skip_tls_verify if skip_tls_verify is not None else bool(row["skip_tls_verify"])
+        if _is_production() and sk:
+            raise ValueError("skip_tls_verify=true is not allowed in production")
         await conn.execute(
             """
             UPDATE n8n_instance
@@ -269,16 +289,14 @@ async def update_n8n_instance(
 
 
 async def delete_n8n_instance(instance_id: UUID) -> bool:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("DELETE FROM n8n_instance WHERE id = $1 RETURNING id", instance_id)
     return row is not None
 
 
 async def list_llm_profiles() -> list[dict[str, Any]]:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, name, provider, config, created_at FROM llm_profile ORDER BY name;"
@@ -327,8 +345,7 @@ def _validate_llm_config(provider: ProviderKind, cfg: dict[str, Any]) -> dict[st
 
 
 async def create_llm_profile(*, name: str, provider: ProviderKind, config: dict[str, Any]) -> UUID:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     cfg = _validate_llm_config(provider, config)
     async with pool.acquire() as conn:
         lid = await conn.fetchval(
@@ -351,8 +368,7 @@ async def update_llm_profile(
     provider: ProviderKind | None = None,
     config: dict[str, Any] | None = None,
 ) -> bool:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT name, provider, config FROM llm_profile WHERE id = $1", profile_id)
         if not row:
@@ -381,16 +397,14 @@ async def update_llm_profile(
 
 
 async def delete_llm_profile(profile_id: UUID) -> bool:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("DELETE FROM llm_profile WHERE id = $1 RETURNING id", profile_id)
     return row is not None
 
 
 async def get_preferences() -> dict[str, Any]:
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT active_n8n_instance_id, active_llm_profile_id FROM app_prefs WHERE id = 1"
@@ -406,8 +420,7 @@ async def set_preferences(
     active_llm_profile_id: UUID | None,
 ) -> None:
     """Set active targets; use None for a slot to clear it."""
-    pool = get_pool()
-    assert pool
+    pool = _require_pool()
     async with pool.acquire() as conn:
         if active_n8n_instance_id is not None:
             exists = await conn.fetchval("SELECT 1 FROM n8n_instance WHERE id = $1", active_n8n_instance_id)

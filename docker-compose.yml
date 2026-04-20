@@ -1,4 +1,18 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: n8n_editor
+      POSTGRES_USER: n8n_editor
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-n8n_editor}
+    volumes:
+      - n8n_workflow_editor_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n_editor -d n8n_editor"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
 
   n8n-workflow-editor:
     build: .
@@ -9,6 +23,10 @@ services:
       DATABASE_URL: postgresql://n8n_editor:${POSTGRES_PASSWORD:-n8n_editor}@postgres:5432/n8n_editor
       N8N_WORKFLOW_EDITOR_DATA_DIR: /data
       N8N_WORKFLOW_EDITOR_LOG_LEVEL: ${N8N_WORKFLOW_EDITOR_LOG_LEVEL:-INFO}
+      N8N_WORKFLOW_EDITOR_ENV: ${N8N_WORKFLOW_EDITOR_ENV:-development}
+      N8N_EDITOR_REQUIRE_AUTH: ${N8N_EDITOR_REQUIRE_AUTH:-false}
+      N8N_EDITOR_AUTH_TOKEN: ${N8N_EDITOR_AUTH_TOKEN:-}
+      N8N_ALLOW_PRIVATE_NETWORK_TARGETS: ${N8N_ALLOW_PRIVATE_NETWORK_TARGETS:-false}
       N8N_BASE_URL: ${N8N_BASE_URL:-}
       N8N_API_KEY: ${N8N_API_KEY:-}
       N8N_HTTP_TIMEOUT_SECONDS: ${N8N_HTTP_TIMEOUT_SECONDS:-60}

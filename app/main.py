@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 from urllib.parse import urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import database, multi_config, settings_store
 from .ai_chat import ChatRequest, ai_status, run_chat
-from .n8n_client import N8nClientError, client_from_resolved
+from .n8n_client import N8nClientError, client_from_resolved, close_shared_clients
 
 logging.basicConfig(level=os.environ.get("N8N_WORKFLOW_EDITOR_LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
@@ -27,8 +28,10 @@ _ASSETS = os.path.join(_STATIC, "assets")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _validate_security_configuration()
     await database.init_db()
     yield
+    await close_shared_clients()
     await database.close_db()
 
 
@@ -36,6 +39,87 @@ app = FastAPI(title="n8n Workflow Editor", version="0.1.0", lifespan=lifespan)
 
 if os.path.isdir(_ASSETS):
     app.mount("/assets", StaticFiles(directory=_ASSETS), name="assets")
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes")
+
+
+def _is_production() -> bool:
+    return os.environ.get("N8N_WORKFLOW_EDITOR_ENV", "").strip().lower() in ("prod", "production")
+
+
+def _api_auth_required() -> bool:
+    # Keep local dev friction low, but enforce auth by default in production.
+    return _bool_env("N8N_EDITOR_REQUIRE_AUTH", default=_is_production())
+
+
+def _expected_api_token() -> str:
+    return os.environ.get("N8N_EDITOR_AUTH_TOKEN", "").strip()
+
+
+def _validate_security_configuration() -> None:
+    if _is_production() and _bool_env("N8N_SKIP_TLS_VERIFY", default=False):
+        raise RuntimeError("N8N_SKIP_TLS_VERIFY must be false in production")
+    if _api_auth_required() and not _expected_api_token():
+        raise RuntimeError(
+            "N8N_EDITOR_AUTH_TOKEN must be configured when API auth is required",
+        )
+
+
+def _authorization_valid(req: Request) -> bool:
+    hdr = req.headers.get("authorization", "")
+    if not hdr.lower().startswith("bearer "):
+        return False
+    token = hdr[7:].strip()
+    expected = _expected_api_token()
+    return bool(expected) and token == expected
+
+
+def _upstream_error(route: str, e: N8nClientError) -> HTTPException:
+    logger.warning(
+        "upstream n8n call failed route=%s status=%s err=%s",
+        route,
+        e.status_code or 502,
+        str(e),
+    )
+    return HTTPException(
+        status_code=e.status_code or 502,
+        detail={"message": str(e), "status": e.status_code or 502},
+    )
+
+
+@app.middleware("http")
+async def enforce_api_auth(request: Request, call_next):
+    if request.url.path.startswith("/api") and _api_auth_required():
+        if not _authorization_valid(request):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def request_observability(request: Request, call_next):
+    request_id = request.headers.get("x-request-id", "").strip() or str(uuid4())
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        "request_id=%s method=%s path=%s status=%s duration_ms=%s",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 
 async def _get_client():
@@ -202,7 +286,7 @@ async def test_n8n():
     except HTTPException:
         raise
     except N8nClientError as e:
-        raise HTTPException(status_code=502, detail={"message": str(e), "body": e.body}) from e
+        raise _upstream_error("/api/n8n/test", e) from e
 
 
 @app.get("/api/workflows")
@@ -217,10 +301,7 @@ async def api_list_workflows(
     except HTTPException:
         raise
     except N8nClientError as e:
-        raise HTTPException(
-            status_code=e.status_code or 502,
-            detail={"message": str(e), "body": e.body},
-        ) from e
+        raise _upstream_error("/api/workflows", e) from e
 
 
 @app.get("/api/workflows/{workflow_id}")
@@ -231,10 +312,7 @@ async def api_get_workflow(workflow_id: str):
     except HTTPException:
         raise
     except N8nClientError as e:
-        raise HTTPException(
-            status_code=e.status_code or 502,
-            detail={"message": str(e), "body": e.body},
-        ) from e
+        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
 
 
 @app.post("/api/workflows")
@@ -245,10 +323,7 @@ async def api_create_workflow(body: dict[str, Any]):
     except HTTPException:
         raise
     except N8nClientError as e:
-        raise HTTPException(
-            status_code=e.status_code or 502,
-            detail={"message": str(e), "body": e.body},
-        ) from e
+        raise _upstream_error("/api/workflows", e) from e
 
 
 @app.patch("/api/workflows/{workflow_id}")
@@ -259,10 +334,7 @@ async def api_patch_workflow(workflow_id: str, body: dict[str, Any]):
     except HTTPException:
         raise
     except N8nClientError as e:
-        raise HTTPException(
-            status_code=e.status_code or 502,
-            detail={"message": str(e), "body": e.body},
-        ) from e
+        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
 
 
 @app.delete("/api/workflows/{workflow_id}")
@@ -273,10 +345,7 @@ async def api_delete_workflow(workflow_id: str):
     except HTTPException:
         raise
     except N8nClientError as e:
-        raise HTTPException(
-            status_code=e.status_code or 502,
-            detail={"message": str(e), "body": e.body},
-        ) from e
+        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
 
 
 @app.get("/api/ai/status")
