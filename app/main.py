@@ -260,51 +260,7 @@ async def api_list_workflows(
         raise _upstream_error("/api/workflows", e) from e
 
 
-@app.get("/api/workflows/{workflow_id}")
-async def api_get_workflow(workflow_id: str):
-    try:
-        c = await _get_client()
-        return await c.get_workflow(workflow_id)
-    except HTTPException:
-        raise
-    except N8nClientError as e:
-        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
-
-
-@app.post("/api/workflows")
-async def api_create_workflow(body: dict[str, Any]):
-    try:
-        c = await _get_client()
-        return await c.create_workflow(body)
-    except HTTPException:
-        raise
-    except N8nClientError as e:
-        raise _upstream_error("/api/workflows", e) from e
-
-
-@app.patch("/api/workflows/{workflow_id}")
-async def api_patch_workflow(workflow_id: str, body: dict[str, Any]):
-    try:
-        c = await _get_client()
-        return await c.update_workflow(workflow_id, body)
-    except HTTPException:
-        raise
-    except N8nClientError as e:
-        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
-
-
-@app.delete("/api/workflows/{workflow_id}")
-async def api_delete_workflow(workflow_id: str):
-    try:
-        c = await _get_client()
-        return await c.delete_workflow(workflow_id)
-    except HTTPException:
-        raise
-    except N8nClientError as e:
-        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
-
-
-# --- Local workflow cache, sync, and backups ---
+# --- Local workflow cache, sync, and backups (before /{workflow_id} routes) ---
 
 
 @app.get("/api/workflows/local")
@@ -418,6 +374,50 @@ async def api_restore_backup(workflow_id: str, backup_id: UUID, body: RestoreBac
         raise HTTPException(status_code=404, detail=str(e)) from e
     except N8nClientError as e:
         raise _upstream_error(f"/api/workflows/local/{workflow_id}/backups/{backup_id}/restore", e) from e
+
+
+@app.get("/api/workflows/{workflow_id}")
+async def api_get_workflow(workflow_id: str):
+    try:
+        c = await _get_client()
+        return await c.get_workflow(workflow_id)
+    except HTTPException:
+        raise
+    except N8nClientError as e:
+        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
+
+
+@app.post("/api/workflows")
+async def api_create_workflow(body: dict[str, Any]):
+    try:
+        c = await _get_client()
+        return await c.create_workflow(body)
+    except HTTPException:
+        raise
+    except N8nClientError as e:
+        raise _upstream_error("/api/workflows", e) from e
+
+
+@app.patch("/api/workflows/{workflow_id}")
+async def api_patch_workflow(workflow_id: str, body: dict[str, Any]):
+    try:
+        c = await _get_client()
+        return await c.update_workflow(workflow_id, body)
+    except HTTPException:
+        raise
+    except N8nClientError as e:
+        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
+
+
+@app.delete("/api/workflows/{workflow_id}")
+async def api_delete_workflow(workflow_id: str):
+    try:
+        c = await _get_client()
+        return await c.delete_workflow(workflow_id)
+    except HTTPException:
+        raise
+    except N8nClientError as e:
+        raise _upstream_error("/api/workflows/{workflow_id}", e) from e
 
 
 @app.get("/api/ai/status")
