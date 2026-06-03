@@ -13,11 +13,24 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
   const [instances, setInstances] = useState<N8nInstanceRow[]>([]);
   const [prefs, setPrefs] = useState<Preferences | null>(null);
 
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingKeyMasked, setEditingKeyMasked] = useState<string | null>(null);
+
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [name, setName] = useState("");
   const [timeout, setTimeout] = useState(60);
   const [skipTls, setSkipTls] = useState(false);
+
+  const resetForm = () => {
+    setEditingId(null);
+    setEditingKeyMasked(null);
+    setName("");
+    setBaseUrl("");
+    setApiKey("");
+    setTimeout(60);
+    setSkipTls(false);
+  };
 
   const loadData = useCallback(async () => {
     const [i, pr] = await Promise.all([
@@ -46,24 +59,54 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
     }
   };
 
-  const addInstance = async () => {
-    if (!baseUrl.trim() || !apiKey.trim()) {
-      setStatusMsg("Base URL and API key are required.");
+  const startEdit = (instance: N8nInstanceRow) => {
+    setEditingId(instance.id);
+    setEditingKeyMasked(instance.api_key_masked);
+    setName(instance.name);
+    setBaseUrl(instance.base_url);
+    setApiKey("");
+    setTimeout(instance.http_timeout_seconds);
+    setSkipTls(instance.skip_tls_verify);
+    setStatusMsg(null);
+  };
+
+  const saveInstance = async () => {
+    if (!baseUrl.trim()) {
+      setStatusMsg("Base URL is required.");
+      return;
+    }
+    if (!editingId && !apiKey.trim()) {
+      setStatusMsg("API key is required for new instances.");
       return;
     }
     setStatusMsg(null);
     setBusy(true);
     try {
+      const payload = {
+        name: name.trim() || "Unnamed",
+        base_url: baseUrl.trim(),
+        http_timeout_seconds: timeout,
+        skip_tls_verify: skipTls,
+        ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+      };
+
+      if (editingId) {
+        await requestJson(`/api/n8n-instances/${encodeURIComponent(editingId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        resetForm();
+        await loadData();
+        onChanged();
+        setStatusMsg("Instance updated.");
+        return;
+      }
+
       const created = await requestJson<{ ok: boolean; id: string }>("/api/n8n-instances", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: name.trim() || "Unnamed",
-          base_url: baseUrl.trim(),
-          api_key: apiKey.trim(),
-          http_timeout_seconds: timeout,
-          skip_tls_verify: skipTls,
-        }),
+        body: JSON.stringify({ ...payload, api_key: apiKey.trim() }),
       });
       await requestJson("/api/preferences", {
         method: "PUT",
@@ -73,11 +116,7 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
           active_llm_profile_id: prefs?.active_llm_profile_id ?? null,
         }),
       });
-      setName("");
-      setBaseUrl("");
-      setApiKey("");
-      setTimeout(60);
-      setSkipTls(false);
+      resetForm();
       await loadData();
       onChanged();
       setStatusMsg("Instance added and set as active.");
@@ -117,6 +156,7 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
     setBusy(true);
     try {
       await requestJson(`/api/n8n-instances/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (editingId === id) resetForm();
       await loadData();
       onChanged();
       setStatusMsg("Instance removed.");
@@ -156,14 +196,21 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
           <div className="instance-list">
             {instances.map((x) => {
               const active = prefs?.active_n8n_instance_id === x.id;
+              const editing = editingId === x.id;
               return (
-                <article key={x.id} className={`instance-card ${active ? "active" : ""}`}>
+                <article key={x.id} className={`instance-card ${active ? "active" : ""} ${editing ? "editing" : ""}`}>
                   <div className="instance-card-head">
                     <div>
                       <div className="strong">{x.name}</div>
                       {active && <span className="badge ok">Active</span>}
+                      {editing && <span className="badge">Editing</span>}
                     </div>
                     <div className="instance-card-actions">
+                      {!editing && (
+                        <button type="button" className="ghost" disabled={busy} onClick={() => startEdit(x)}>
+                          Edit
+                        </button>
+                      )}
                       {!active && (
                         <button type="button" className="ghost" disabled={busy} onClick={() => void setActive(x.id)}>
                           Set active
@@ -186,7 +233,7 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
         </section>
 
         <section className="connections-card">
-          <h2>Add instance</h2>
+          <h2>{editingId ? "Edit instance" : "Add instance"}</h2>
 
           <div className="field">
             <label htmlFor="connName">Display name</label>
@@ -218,10 +265,14 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder="X-N8N-API-KEY"
+              placeholder={editingId ? "Leave blank to keep current key" : "X-N8N-API-KEY"}
               autoComplete="off"
             />
-            <span className="field-hint">Create under n8n Settings → API.</span>
+            <span className="field-hint">
+              {editingId
+                ? `Current key: ${editingKeyMasked ?? "—"}. Leave blank to keep it.`
+                : "Create under n8n Settings → API."}
+            </span>
           </div>
 
           <div className="field-row">
@@ -243,9 +294,14 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
           </div>
 
           <div className="connections-form-actions">
-            <button type="button" className="primary" disabled={busy} onClick={() => void addInstance()}>
-              Add instance
+            <button type="button" className="primary" disabled={busy} onClick={() => void saveInstance()}>
+              {editingId ? "Save changes" : "Add instance"}
             </button>
+            {editingId && (
+              <button type="button" className="ghost" disabled={busy} onClick={resetForm}>
+                Cancel
+              </button>
+            )}
           </div>
         </section>
 

@@ -483,6 +483,11 @@ select {
   background: rgba(91, 140, 255, 0.08);
 }
 
+.instance-card.editing {
+  border-color: rgba(255, 193, 77, 0.45);
+  background: rgba(255, 193, 77, 0.06);
+}
+
 .instance-card-head {
   display: flex;
   justify-content: space-between;
