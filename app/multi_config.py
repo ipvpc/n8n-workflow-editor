@@ -119,11 +119,18 @@ async def resolve_active_llm() -> ResolvedLlm | None:
     return None
 
 
-def _row_to_resolved_llm(provider: str, config: Any) -> ResolvedLlm:
+def _config_to_dict(config: Any) -> dict[str, Any]:
+    if not config:
+        return {}
     if isinstance(config, str):
-        cfg = json.loads(config)
-    else:
-        cfg = dict(config) if config else {}
+        return json.loads(config)
+    if isinstance(config, dict):
+        return dict(config)
+    return dict(config)
+
+
+def _row_to_resolved_llm(provider: str, config: Any) -> ResolvedLlm:
+    cfg = _config_to_dict(config)
     temp = float(cfg.get("temperature", 0.2))
     max_tok = int(cfg.get("max_tokens", 4096))
     if provider == "azure_openai":
@@ -269,7 +276,7 @@ async def list_llm_profiles() -> list[dict[str, Any]]:
         )
     out: list[dict[str, Any]] = []
     for r in rows:
-        cfg = dict(r["config"]) if r["config"] else {}
+        cfg = _config_to_dict(r["config"])
         out.append(
             {
                 "id": str(r["id"]),
@@ -341,7 +348,7 @@ async def update_llm_profile(
             return False
         n = name if name is not None else row["name"]
         prov = provider if provider is not None else str(row["provider"])
-        old_cfg = dict(row["config"]) if row["config"] else {}
+        old_cfg = _config_to_dict(row["config"])
         if provider is not None and provider != str(row["provider"]) and config is None:
             raise ValueError("config is required when changing provider type")
         if config is not None:

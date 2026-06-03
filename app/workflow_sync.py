@@ -111,6 +111,16 @@ async def list_local_workflows() -> list[dict[str, Any]]:
     ]
 
 
+def _json_to_dict(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    if isinstance(value, str):
+        return json.loads(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return dict(value)
+
+
 async def get_local_workflow(remote_workflow_id: str) -> dict[str, Any]:
     pool = _require_pool()
     iid = await _active_instance_id()
@@ -126,7 +136,7 @@ async def get_local_workflow(remote_workflow_id: str) -> dict[str, Any]:
         )
     if not row:
         raise ValueError("Workflow not found in local cache. Run Sync from n8n first.")
-    data = dict(row["workflow_json"]) if row["workflow_json"] else {}
+    data = _json_to_dict(row["workflow_json"])
     data["_local"] = {
         "is_dirty": bool(row["is_dirty"]),
         "synced_at": row["synced_at"].isoformat() if row["synced_at"] else None,
@@ -390,7 +400,7 @@ async def create_backup(
             row["id"],
             row["name"],
             label or "Manual backup",
-            json.dumps(dict(row["workflow_json"])),
+            json.dumps(_json_to_dict(row["workflow_json"])),
             source,
         )
     return {"id": str(bid), "label": label or "Manual backup", "source": source}
@@ -438,7 +448,7 @@ async def get_backup(remote_workflow_id: str, backup_id: UUID) -> dict[str, Any]
         )
     if not row:
         raise ValueError("Backup not found")
-    data = dict(row["workflow_json"]) if row["workflow_json"] else {}
+    data = _json_to_dict(row["workflow_json"])
     data["_backup"] = {
         "label": row["label"],
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
