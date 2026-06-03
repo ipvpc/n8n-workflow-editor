@@ -134,11 +134,14 @@ def validate_base_url(url: str) -> str:
 
 
 def _allow_private_network_targets() -> bool:
-    return os.environ.get("N8N_ALLOW_PRIVATE_NETWORK_TARGETS", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    raw = os.environ.get("N8N_ALLOW_PRIVATE_NETWORK_TARGETS", "").strip().lower()
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("0", "false", "no"):
+        return False
+    # Lab/default: allow LAN n8n (e.g. 192.168.x.x). Production blocks unless explicitly enabled.
+    env = os.environ.get("N8N_WORKFLOW_EDITOR_ENV", "development").strip().lower()
+    return env not in ("prod", "production")
 
 
 def _host_is_private_or_local(host: str) -> bool:

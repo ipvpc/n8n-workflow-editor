@@ -51,7 +51,7 @@ On first startup, if `N8N_BASE_URL` and `N8N_API_KEY` are set in the environment
 - `N8N_EDITOR_REQUIRE_AUTH` (default `false` in development) — when `true`, all `/api/*` routes require `Authorization: Bearer <token>`.
 - `N8N_EDITOR_AUTH_TOKEN` — required when API auth is enabled.
 - `N8N_WORKFLOW_EDITOR_ENV` — set to `production` to enable stricter safety checks.
-- `N8N_ALLOW_PRIVATE_NETWORK_TARGETS` (default `false`) — allow `N8N_BASE_URL` hosts that resolve to private/local addresses.
+- `N8N_ALLOW_PRIVATE_NETWORK_TARGETS` — allow LAN/private n8n URLs (e.g. `192.168.x.x`). Defaults to **allowed** in development, **blocked** in production unless set to `true`.
 - Browser UI reads the bearer token from `localStorage["n8n_editor_auth_token"]` and sends it automatically.
 
 ### n8n connection
