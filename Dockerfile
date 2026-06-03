@@ -9,8 +9,7 @@ RUN npm run build
 FROM python:3.12-slim-bookworm
 WORKDIR /app
 COPY requirements.txt .
-COPY constraints.txt .
-RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY --from=ui /build/app/static ./app/static
