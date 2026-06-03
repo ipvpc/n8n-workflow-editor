@@ -1,10 +1,11 @@
 services:
   postgres:
     image: postgres:16-alpine
+    env_file:
+      - .env
     environment:
       POSTGRES_DB: n8n_editor
       POSTGRES_USER: n8n_editor
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-n8n_editor}
     volumes:
       - n8n_workflow_editor_pg:/var/lib/postgresql/data
     healthcheck:
@@ -22,7 +23,6 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://n8n_editor:${POSTGRES_PASSWORD:-n8n_editor}@postgres:5432/n8n_editor
       N8N_WORKFLOW_EDITOR_DATA_DIR: /data
       N8N_WORKFLOW_EDITOR_LOG_LEVEL: ${N8N_WORKFLOW_EDITOR_LOG_LEVEL:-INFO}
       N8N_WORKFLOW_EDITOR_ENV: ${N8N_WORKFLOW_EDITOR_ENV:-development}
