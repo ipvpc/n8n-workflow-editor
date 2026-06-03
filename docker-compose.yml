@@ -19,6 +19,8 @@ services:
     image: n8n-workflow-editor:local
     ports:
       - "${N8N_WORKFLOW_EDITOR_PORT:-8105}:8105"
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql://n8n_editor:${POSTGRES_PASSWORD:-n8n_editor}@postgres:5432/n8n_editor
       N8N_WORKFLOW_EDITOR_DATA_DIR: /data
