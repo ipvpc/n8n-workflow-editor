@@ -1,8 +1,4 @@
-type WorkflowRow = {
-  id: string;
-  name?: string;
-  active?: boolean;
-};
+import type { WorkflowRow } from "../types";
 
 type Props = {
   filter: string;
@@ -57,6 +53,7 @@ export function WorkflowSidebar(props: Props) {
             <div className="meta">
               {w.id}
               {w.active === false ? " · inactive" : ""}
+              {w.is_dirty ? " · modified" : ""}
               {loadingWorkflowId === w.id ? " · loading..." : ""}
             </div>
           </div>

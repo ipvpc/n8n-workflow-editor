@@ -6,6 +6,7 @@ services:
     environment:
       POSTGRES_DB: n8n_editor
       POSTGRES_USER: n8n_editor
+      POSTGRES_PASSWORD: n8n_editor
     volumes:
       - n8n_workflow_editor_pg:/var/lib/postgresql/data
     healthcheck:

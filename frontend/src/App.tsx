@@ -1,54 +1,29 @@
 import Editor from "@monaco-editor/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { WorkflowBackupsModal } from "./components/WorkflowBackupsModal";
 import { ChatPanel } from "./components/ChatPanel";
+import { N8nConnectionsPage } from "./components/N8nConnectionsPage";
 import { WorkflowSidebar } from "./components/WorkflowSidebar";
+import { requestJson } from "./lib/api";
+import type { LlmProfileRow, Preferences, SettingsMeta, WorkflowRow } from "./types";
 
-type WorkflowRow = {
-  id: string;
-  name?: string;
-  active?: boolean;
-};
+type AppView = "editor" | "connections";
 
 type ChatTurn = { role: "user" | "assistant"; content: string };
 
-type SettingsMeta = {
-  base_url: string | null;
-  api_key_masked: string | null;
-  has_api_key: boolean;
-  source: string;
-  instance_id?: string | null;
-  instance_name?: string | null;
-};
+function workflowBodyForEditor(data: unknown): string {
+  if (!data || typeof data !== "object") return "{}";
+  const o = { ...(data as Record<string, unknown>) };
+  delete o._local;
+  delete o._backup;
+  return JSON.stringify(o, null, 2);
+}
 
-type N8nInstanceRow = {
-  id: string;
-  name: string;
-  base_url: string;
-  api_key_masked: string;
-  http_timeout_seconds: number;
-  skip_tls_verify: boolean;
-};
-
-type LlmProfileRow = {
-  id: string;
-  name: string;
-  provider: "azure_openai" | "openai_compatible";
-  config_public: Record<string, unknown>;
-};
-
-type Preferences = {
-  active_n8n_instance_id: string | null;
-  active_llm_profile_id: string | null;
-};
-
-function workflowsFromResponse(j: unknown): WorkflowRow[] {
-  if (Array.isArray(j)) return j as WorkflowRow[];
-  if (j && typeof j === "object") {
-    const o = j as Record<string, unknown>;
-    if (Array.isArray(o.data)) return o.data as WorkflowRow[];
-    if (Array.isArray(o.workflows)) return o.workflows as WorkflowRow[];
-  }
-  return [];
+function parseEditorBody(text: string): Record<string, unknown> {
+  const parsed = JSON.parse(text) as Record<string, unknown>;
+  delete parsed._local;
+  delete parsed._backup;
+  return parsed;
 }
 
 function formatJson(text: string): string {
@@ -72,52 +47,13 @@ function extractJsonFromMarkdown(md: string): string | null {
   return null;
 }
 
-async function parseApiError(r: Response): Promise<string> {
-  const fallback = `${r.status} ${r.statusText || "Request failed"}`.trim();
-  const body = (await r.json().catch(() => ({}))) as { detail?: unknown; message?: unknown };
-  if (typeof body.detail === "string") return body.detail;
-  if (body.detail && typeof body.detail === "object") return JSON.stringify(body.detail);
-  if (typeof body.message === "string") return body.message;
-  return fallback;
-}
-
-function authHeader(): Record<string, string> {
-  const token = window.localStorage.getItem("n8n_editor_auth_token")?.trim();
-  if (!token) return {};
-  return { Authorization: `Bearer ${token}` };
-}
-
-async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers ?? {});
-  for (const [k, v] of Object.entries(authHeader())) headers.set(k, v);
-  let r: Response;
-  try {
-    r = await fetch(url, { ...init, headers });
-  } catch (e) {
-    throw new Error(`Network error: ${String(e)}`);
-  }
-  if (!r.ok) {
-    throw new Error(await parseApiError(r));
-  }
-  return (await r.json()) as T;
-}
-
 export default function App() {
-  const [dbMode, setDbMode] = useState(false);
+  const [view, setView] = useState<AppView>("editor");
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [baseUrlInput, setBaseUrlInput] = useState("");
-  const [apiKeyInput, setApiKeyInput] = useState("");
   const [settingsMeta, setSettingsMeta] = useState<SettingsMeta | null>(null);
 
-  const [instances, setInstances] = useState<N8nInstanceRow[]>([]);
   const [profiles, setProfiles] = useState<LlmProfileRow[]>([]);
   const [prefs, setPrefs] = useState<Preferences | null>(null);
-
-  const [newN8nName, setNewN8nName] = useState("");
-  const [newN8nBase, setNewN8nBase] = useState("");
-  const [newN8nKey, setNewN8nKey] = useState("");
-  const [newN8nTimeout, setNewN8nTimeout] = useState(60);
-  const [newN8nSkipTls, setNewN8nSkipTls] = useState(false);
 
   const [newLlmName, setNewLlmName] = useState("");
   const [newLlmProvider, setNewLlmProvider] = useState<"azure_openai" | "openai_compatible">("openai_compatible");
@@ -142,39 +78,29 @@ export default function App() {
   const [chatBusy, setChatBusy] = useState(false);
   const [loadingWorkflowId, setLoadingWorkflowId] = useState<string | null>(null);
   const [savingWorkflow, setSavingWorkflow] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [backupsOpen, setBackupsOpen] = useState(false);
   const workflowLoadSeq = useRef(0);
-
-  const loadCapabilities = useCallback(async () => {
-    try {
-      const j = await requestJson<{ database?: boolean }>("/api/capabilities");
-      setDbMode(!!j.database);
-    } catch {
-      setDbMode(false);
-    }
-  }, []);
 
   const loadSettings = useCallback(async () => {
     try {
       const j = await requestJson<SettingsMeta>("/api/settings/n8n");
       setSettingsMeta(j);
-      if (j.base_url) setBaseUrlInput(j.base_url);
     } catch {
       // Keep existing values when settings load fails.
     }
   }, []);
 
-  const loadDbBundle = useCallback(async () => {
+  const loadLlmBundle = useCallback(async () => {
     try {
-      const [i, p, pr] = await Promise.all([
-        requestJson<N8nInstanceRow[]>("/api/n8n-instances"),
+      const [p, pr] = await Promise.all([
         requestJson<LlmProfileRow[]>("/api/llm-profiles"),
         requestJson<Preferences>("/api/preferences"),
       ]);
-      setInstances(i);
       setProfiles(p);
       setPrefs(pr);
     } catch (e) {
-      setStatusMsg(`Failed to load DB settings: ${String(e)}`);
+      setStatusMsg(`Failed to load LLM settings: ${String(e)}`);
     }
   }, []);
 
@@ -190,17 +116,13 @@ export default function App() {
   const refreshWorkflows = useCallback(async () => {
     setStatusMsg(null);
     try {
-      const j = await requestJson<unknown>("/api/workflows?limit=200");
-      setWorkflows(workflowsFromResponse(j));
+      const rows = await requestJson<WorkflowRow[]>("/api/workflows/local");
+      setWorkflows(rows);
     } catch (e) {
       setStatusMsg(String(e));
       setWorkflows([]);
     }
   }, []);
-
-  useEffect(() => {
-    void loadCapabilities();
-  }, [loadCapabilities]);
 
   useEffect(() => {
     void loadSettings();
@@ -209,8 +131,13 @@ export default function App() {
   }, [loadSettings, loadAiStatus, refreshWorkflows]);
 
   useEffect(() => {
-    if (settingsOpen && dbMode) void loadDbBundle();
-  }, [settingsOpen, dbMode, loadDbBundle]);
+    if (settingsOpen) void loadLlmBundle();
+  }, [settingsOpen, loadLlmBundle]);
+
+  const onConnectionChanged = useCallback(async () => {
+    await loadSettings();
+    await refreshWorkflows();
+  }, [loadSettings, refreshWorkflows]);
 
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -224,31 +151,30 @@ export default function App() {
 
   const normId = (s: string | null | undefined) => (s && s.length ? s : null);
 
-  const applyPreferences = useCallback(
-    async (next: Preferences) => {
+  const applyLlmPreference = useCallback(
+    async (activeLlmProfileId: string | null) => {
+      if (!prefs) return;
       setStatusMsg(null);
       try {
         await requestJson<{ ok: boolean }>("/api/preferences", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            active_n8n_instance_id: normId(next.active_n8n_instance_id ?? undefined),
-            active_llm_profile_id: normId(next.active_llm_profile_id ?? undefined),
+            active_n8n_instance_id: prefs.active_n8n_instance_id,
+            active_llm_profile_id: normId(activeLlmProfileId ?? undefined),
           }),
         });
         setPrefs({
-          active_n8n_instance_id: normId(next.active_n8n_instance_id ?? undefined),
-          active_llm_profile_id: normId(next.active_llm_profile_id ?? undefined),
+          active_n8n_instance_id: prefs.active_n8n_instance_id,
+          active_llm_profile_id: normId(activeLlmProfileId ?? undefined),
         });
-        await loadSettings();
         await loadAiStatus();
-        await refreshWorkflows();
-        setStatusMsg("Active targets updated.");
+        setStatusMsg("Active LLM profile updated.");
       } catch (e) {
         setStatusMsg(String(e));
       }
     },
-    [loadSettings, loadAiStatus, refreshWorkflows],
+    [loadAiStatus, prefs],
   );
 
   const loadWorkflow = useCallback(async (id: string) => {
@@ -260,9 +186,9 @@ export default function App() {
     const seq = ++workflowLoadSeq.current;
     setLoadingWorkflowId(id);
     try {
-      const data = await requestJson<unknown>(`/api/workflows/${encodeURIComponent(id)}`);
+      const data = await requestJson<unknown>(`/api/workflows/local/${encodeURIComponent(id)}`);
       if (seq !== workflowLoadSeq.current) return;
-      setEditorText(JSON.stringify(data, null, 2));
+      setEditorText(workflowBodyForEditor(data));
       setSelectedId(id);
       setDirty(false);
     } catch (e) {
@@ -275,9 +201,9 @@ export default function App() {
 
   const saveWorkflow = useCallback(async () => {
     if (!selectedId || savingWorkflow) return;
-    let body: object;
+    let body: Record<string, unknown>;
     try {
-      body = JSON.parse(editorText) as object;
+      body = parseEditorBody(editorText);
     } catch (e) {
       setStatusMsg(`Invalid JSON: ${e}`);
       return;
@@ -285,20 +211,113 @@ export default function App() {
     setStatusMsg(null);
     setSavingWorkflow(true);
     try {
-      const data = await requestJson<unknown>(`/api/workflows/${encodeURIComponent(selectedId)}`, {
-        method: "PATCH",
+      const data = await requestJson<unknown>(`/api/workflows/local/${encodeURIComponent(selectedId)}`, {
+        method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      setEditorText(JSON.stringify(data, null, 2));
+      setEditorText(workflowBodyForEditor(data));
       setDirty(false);
-      setStatusMsg("Saved.");
+      await refreshWorkflows();
+      setStatusMsg("Saved locally.");
     } catch (e) {
       setStatusMsg(String(e));
     } finally {
       setSavingWorkflow(false);
     }
-  }, [editorText, savingWorkflow, selectedId]);
+  }, [editorText, refreshWorkflows, savingWorkflow, selectedId]);
+
+  const syncAllFromN8n = useCallback(async () => {
+    if (syncBusy) return;
+    setSyncBusy(true);
+    setStatusMsg(null);
+    try {
+      const stats = await requestJson<{ created: number; updated: number; skipped: number }>(
+        "/api/workflows/sync?force=false",
+        { method: "POST" },
+      );
+      await refreshWorkflows();
+      if (selectedId) {
+        const data = await requestJson<unknown>(`/api/workflows/local/${encodeURIComponent(selectedId)}`);
+        setEditorText(workflowBodyForEditor(data));
+        setDirty(false);
+      }
+      setStatusMsg(
+        `Synced from n8n: ${stats.created} new, ${stats.updated} updated, ${stats.skipped} skipped.`,
+      );
+    } catch (e) {
+      setStatusMsg(String(e));
+    } finally {
+      setSyncBusy(false);
+    }
+  }, [refreshWorkflows, selectedId, syncBusy]);
+
+  const pullFromN8n = useCallback(async () => {
+    if (!selectedId || syncBusy) return;
+    if (dirty) {
+      const proceed = window.confirm("Discard local changes and pull from n8n?");
+      if (!proceed) return;
+    }
+    setSyncBusy(true);
+    setStatusMsg(null);
+    try {
+      const data = await requestJson<unknown>(
+        `/api/workflows/local/${encodeURIComponent(selectedId)}/pull?force=true`,
+        { method: "POST" },
+      );
+      setEditorText(workflowBodyForEditor(data));
+      setDirty(false);
+      await refreshWorkflows();
+      setStatusMsg("Pulled from n8n.");
+    } catch (e) {
+      setStatusMsg(String(e));
+    } finally {
+      setSyncBusy(false);
+    }
+  }, [dirty, refreshWorkflows, selectedId, syncBusy]);
+
+  const pushToN8n = useCallback(async () => {
+    if (!selectedId || syncBusy) return;
+    if (dirty) {
+      setStatusMsg("Save locally before pushing to n8n.");
+      return;
+    }
+    setSyncBusy(true);
+    setStatusMsg(null);
+    try {
+      const data = await requestJson<unknown>(
+        `/api/workflows/local/${encodeURIComponent(selectedId)}/push`,
+        { method: "POST" },
+      );
+      setEditorText(workflowBodyForEditor(data));
+      setDirty(false);
+      await refreshWorkflows();
+      setStatusMsg("Pushed to n8n.");
+    } catch (e) {
+      setStatusMsg(String(e));
+    } finally {
+      setSyncBusy(false);
+    }
+  }, [dirty, refreshWorkflows, selectedId, syncBusy]);
+
+  const backupWorkflow = useCallback(async () => {
+    if (!selectedId || syncBusy) return;
+    const label = window.prompt("Backup label (optional)", "Manual backup") ?? "Manual backup";
+    setSyncBusy(true);
+    setStatusMsg(null);
+    try {
+      await requestJson(`/api/workflows/local/${encodeURIComponent(selectedId)}/backups`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label }),
+      });
+      setStatusMsg("Backup created.");
+    } catch (e) {
+      setStatusMsg(String(e));
+    } finally {
+      setSyncBusy(false);
+    }
+  }, [selectedId, syncBusy]);
 
   const onFormat = useCallback(() => {
     try {
@@ -308,79 +327,6 @@ export default function App() {
       setStatusMsg(`Cannot format: ${e}`);
     }
   }, [editorText]);
-
-  const testConnection = useCallback(async () => {
-    setStatusMsg(null);
-    try {
-      await requestJson<{ ok: boolean }>("/api/n8n/test", { method: "POST" });
-      setStatusMsg("n8n connection OK.");
-    } catch (e) {
-      setStatusMsg(String(e));
-    }
-  }, []);
-
-  const saveSettings = useCallback(async () => {
-    setStatusMsg(null);
-    const payload: { base_url: string; api_key?: string } = { base_url: baseUrlInput.trim() };
-    const k = apiKeyInput.trim();
-    if (k) payload.api_key = k;
-    try {
-      await requestJson<{ ok: boolean }>("/api/settings/n8n", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      setApiKeyInput("");
-      setSettingsOpen(false);
-      await loadSettings();
-      await refreshWorkflows();
-      setStatusMsg("Settings saved.");
-    } catch (e) {
-      setStatusMsg(String(e));
-    }
-  }, [apiKeyInput, baseUrlInput, loadSettings, refreshWorkflows]);
-
-  const addN8nInstance = useCallback(async () => {
-    setStatusMsg(null);
-    try {
-      await requestJson<{ ok: boolean }>("/api/n8n-instances", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: newN8nName.trim() || "Unnamed",
-          base_url: newN8nBase.trim(),
-          api_key: newN8nKey.trim(),
-          http_timeout_seconds: newN8nTimeout,
-          skip_tls_verify: newN8nSkipTls,
-        }),
-      });
-      setNewN8nName("");
-      setNewN8nBase("");
-      setNewN8nKey("");
-      setNewN8nTimeout(60);
-      setNewN8nSkipTls(false);
-      await loadDbBundle();
-      setStatusMsg("n8n remote added.");
-    } catch (e) {
-      setStatusMsg(String(e));
-    }
-  }, [newN8nBase, newN8nKey, newN8nName, newN8nSkipTls, newN8nTimeout, loadDbBundle]);
-
-  const removeN8nInstance = useCallback(
-    async (id: string) => {
-      if (!confirm("Delete this n8n remote?")) return;
-      setStatusMsg(null);
-      try {
-        await requestJson<{ ok: boolean }>(`/api/n8n-instances/${encodeURIComponent(id)}`, { method: "DELETE" });
-        await loadDbBundle();
-        await loadSettings();
-        setStatusMsg("Remote removed.");
-      } catch (e) {
-        setStatusMsg(String(e));
-      }
-    },
-    [loadDbBundle, loadSettings],
-  );
 
   const addLlmProfile = useCallback(async () => {
     setStatusMsg(null);
@@ -412,13 +358,13 @@ export default function App() {
       setAzureKey("");
       setAzureDep("");
       setOaiKey("");
-      await loadDbBundle();
+      await loadLlmBundle();
       await loadAiStatus();
       setStatusMsg("LLM profile added.");
     } catch (e) {
       setStatusMsg(String(e));
     }
-  }, [azureDep, azureEp, azureKey, azureVer, loadAiStatus, loadDbBundle, newLlmName, newLlmProvider, oaiBase, oaiKey, oaiModel]);
+  }, [azureDep, azureEp, azureKey, azureVer, loadAiStatus, loadLlmBundle, newLlmName, newLlmProvider, oaiBase, oaiKey, oaiModel]);
 
   const removeLlmProfile = useCallback(
     async (id: string) => {
@@ -426,14 +372,14 @@ export default function App() {
       setStatusMsg(null);
       try {
         await requestJson<{ ok: boolean }>(`/api/llm-profiles/${encodeURIComponent(id)}`, { method: "DELETE" });
-        await loadDbBundle();
+        await loadLlmBundle();
         await loadAiStatus();
         setStatusMsg("Profile removed.");
       } catch (e) {
         setStatusMsg(String(e));
       }
     },
-    [loadAiStatus, loadDbBundle],
+    [loadAiStatus, loadLlmBundle],
   );
 
   const sendChat = useCallback(async () => {
@@ -481,7 +427,7 @@ export default function App() {
       try {
         setEditorText(formatJson(extracted));
         setDirty(true);
-        setStatusMsg("Editor updated from assistant JSON. Review and Save.");
+        setStatusMsg("Editor updated from assistant JSON. Save locally, then push to n8n.");
       } catch (e) {
         setStatusMsg(`Could not apply: ${e}`);
       }
@@ -511,16 +457,28 @@ export default function App() {
   }, [settingsMeta]);
 
   return (
+    <>
+      {view === "connections" ? (
+        <N8nConnectionsPage
+          onBack={() => setView("editor")}
+          onChanged={() => void onConnectionChanged()}
+        />
+      ) : (
     <div className="app-shell">
       <header className="topbar">
         <h1>n8n Workflow Editor</h1>
         <div className="topbar-actions">
-          {dbMode && <span className="badge ok">PostgreSQL</span>}
           {aiOk === true && <span className="badge ok">AI ready</span>}
           {aiOk === false && <span className="badge warn">AI not configured</span>}
           {statusMsg && <span className="badge">{statusMsg}</span>}
+          <button type="button" className="ghost" disabled={syncBusy} onClick={() => void syncAllFromN8n()}>
+            Sync from n8n
+          </button>
           <button type="button" className="ghost" onClick={() => void refreshWorkflows()}>
             Refresh list
+          </button>
+          <button type="button" className="ghost" onClick={() => setView("connections")}>
+            Connections
           </button>
           <button type="button" className="ghost" onClick={() => setSettingsOpen(true)}>
             Settings
@@ -540,14 +498,46 @@ export default function App() {
 
       <section className="editor-panel">
         <div className="editor-toolbar">
-          <div className="title">{editorTitle}</div>
+          <div className="title">{editorTitle}{dirty ? " · modified" : ""}</div>
           <button
             type="button"
             className="primary"
             disabled={!selectedId || !dirty || savingWorkflow}
             onClick={() => void saveWorkflow()}
           >
-            Save to n8n
+            Save locally
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            disabled={!selectedId || syncBusy}
+            onClick={() => void pushToN8n()}
+          >
+            Push to n8n
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            disabled={!selectedId || syncBusy}
+            onClick={() => void pullFromN8n()}
+          >
+            Pull from n8n
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            disabled={!selectedId || syncBusy}
+            onClick={() => void backupWorkflow()}
+          >
+            Backup
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            disabled={!selectedId}
+            onClick={() => setBackupsOpen(true)}
+          >
+            Restore
           </button>
           <button type="button" className="ghost" onClick={onFormat}>
             Format JSON
@@ -584,6 +574,17 @@ export default function App() {
         onClear={() => setChat([])}
       />
 
+      {backupsOpen && selectedId && (
+        <WorkflowBackupsModal
+          workflowId={selectedId}
+          onClose={() => setBackupsOpen(false)}
+          onRestored={() => {
+            void refreshWorkflows();
+            void loadWorkflow(selectedId);
+          }}
+        />
+      )}
+
       {settingsOpen && (
         <div className="modal-backdrop" role="presentation" onClick={() => setSettingsOpen(false)}>
           <div
@@ -593,135 +594,38 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <h2>Settings</h2>
+            <p className="muted">
+              Manage LLM profiles for the assistant. n8n connections are configured on the{" "}
+              <button type="button" className="link-button" onClick={() => { setSettingsOpen(false); setView("connections"); }}>
+                Connections
+              </button>{" "}
+              page.
+            </p>
 
-            {dbMode ? (
-              <>
-                <p className="muted">
-                  Connections and LLM credentials are stored in PostgreSQL. Pick the active n8n remote and LLM profile for
-                  the workflow list, editor saves, and chat.
-                </p>
-
-                <h3>Active selection</h3>
-                {!prefs && <div className="muted">Loading preferences…</div>}
-                {prefs && (
-                  <div className="field-row">
-                    <div className="field">
-                      <label htmlFor="selN8n">Active n8n remote</label>
-                      <select
-                        id="selN8n"
-                        value={prefs.active_n8n_instance_id ?? ""}
-                        onChange={(e) => {
-                          const v = e.target.value || null;
-                          void applyPreferences({
-                            active_n8n_instance_id: v,
-                            active_llm_profile_id: prefs.active_llm_profile_id,
-                          });
-                        }}
-                      >
-                        <option value="">— none —</option>
-                        {instances.map((x) => (
-                          <option key={x.id} value={x.id}>
-                            {x.name} ({x.base_url})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="field">
-                      <label htmlFor="selLlm">Active LLM profile</label>
-                      <select
-                        id="selLlm"
-                        value={prefs.active_llm_profile_id ?? ""}
-                        onChange={(e) => {
-                          const v = e.target.value || null;
-                          void applyPreferences({
-                            active_n8n_instance_id: prefs.active_n8n_instance_id,
-                            active_llm_profile_id: v,
-                          });
-                        }}
-                      >
-                        <option value="">— none —</option>
-                        {profiles.map((x) => (
-                          <option key={x.id} value={x.id}>
-                            {x.name} ({x.provider})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                )}
-
-                <h3>n8n remotes</h3>
-                <div className="table-like">
-                  {instances.map((x) => (
-                    <div key={x.id} className="table-row">
-                      <div>
-                        <div className="strong">{x.name}</div>
-                        <div className="muted small">{x.base_url}</div>
-                        <div className="muted small">
-                          {x.api_key_masked} · timeout {x.http_timeout_seconds}s
-                          {x.skip_tls_verify ? " · TLS verify off" : ""}
-                        </div>
-                      </div>
-                      <button type="button" className="ghost" onClick={() => void removeN8nInstance(x.id)}>
-                        Delete
-                      </button>
-                    </div>
+            <h3>Active LLM profile</h3>
+            {!prefs && <div className="muted">Loading preferences…</div>}
+            {prefs && (
+              <div className="field">
+                <label htmlFor="selLlm">Active LLM profile</label>
+                <select
+                  id="selLlm"
+                  value={prefs.active_llm_profile_id ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value || null;
+                    void applyLlmPreference(v);
+                  }}
+                >
+                  <option value="">— none —</option>
+                  {profiles.map((x) => (
+                    <option key={x.id} value={x.id}>
+                      {x.name} ({x.provider})
+                    </option>
                   ))}
-                  {instances.length === 0 && <div className="muted">No remotes yet.</div>}
-                </div>
+                </select>
+              </div>
+            )}
 
-                <h4>Add n8n remote</h4>
-                <div className="field">
-                  <label htmlFor="nnName">Name</label>
-                  <input id="nnName" value={newN8nName} onChange={(e) => setNewN8nName(e.target.value)} autoComplete="off" />
-                </div>
-                <div className="field">
-                  <label htmlFor="nnBase">Base URL</label>
-                  <input
-                    id="nnBase"
-                    value={newN8nBase}
-                    onChange={(e) => setNewN8nBase(e.target.value)}
-                    placeholder="https://n8n.example.com"
-                    autoComplete="off"
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor="nnKey">API key</label>
-                  <input
-                    id="nnKey"
-                    type="password"
-                    value={newN8nKey}
-                    onChange={(e) => setNewN8nKey(e.target.value)}
-                    autoComplete="off"
-                  />
-                </div>
-                <div className="field-row">
-                  <div className="field">
-                    <label htmlFor="nnTo">HTTP timeout (s)</label>
-                    <input
-                      id="nnTo"
-                      type="number"
-                      min={1}
-                      max={600}
-                      value={newN8nTimeout}
-                      onChange={(e) => setNewN8nTimeout(Number(e.target.value) || 60)}
-                    />
-                  </div>
-                  <label className="inline-check">
-                    <input type="checkbox" checked={newN8nSkipTls} onChange={(e) => setNewN8nSkipTls(e.target.checked)} />
-                    Skip TLS verify (lab only)
-                  </label>
-                </div>
-                <div className="modal-actions">
-                  <button type="button" className="primary" onClick={() => void addN8nInstance()}>
-                    Add remote
-                  </button>
-                  <button type="button" className="ghost" onClick={() => void testConnection()}>
-                    Test active n8n
-                  </button>
-                </div>
-
-                <h3>LLM profiles</h3>
+            <h3>LLM profiles</h3>
                 <div className="table-like">
                   {profiles.map((x) => (
                     <div key={x.id} className="table-row">
@@ -797,45 +701,6 @@ export default function App() {
                     Add LLM profile
                   </button>
                 </div>
-              </>
-            ) : (
-              <>
-                <h3>n8n connection</h3>
-                <p className="muted">Saved to /data/n8n-connection.json in Docker. Overrides N8N_BASE_URL / N8N_API_KEY from env.</p>
-                <div className="field">
-                  <label htmlFor="baseUrl">Base URL</label>
-                  <input
-                    id="baseUrl"
-                    value={baseUrlInput}
-                    onChange={(e) => setBaseUrlInput(e.target.value)}
-                    placeholder="https://n8n.example.com"
-                    autoComplete="off"
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor="apiKey">API key (leave blank to keep current)</label>
-                  <input
-                    id="apiKey"
-                    type="password"
-                    value={apiKeyInput}
-                    onChange={(e) => setApiKeyInput(e.target.value)}
-                    placeholder={settingsMeta?.api_key_masked ?? "X-N8N-API-KEY"}
-                    autoComplete="off"
-                  />
-                </div>
-                <div className="modal-actions">
-                  <button type="button" className="ghost" onClick={() => void testConnection()}>
-                    Test connection
-                  </button>
-                  <button type="button" className="ghost" onClick={() => setSettingsOpen(false)}>
-                    Cancel
-                  </button>
-                  <button type="button" className="primary" onClick={() => void saveSettings()}>
-                    Save
-                  </button>
-                </div>
-              </>
-            )}
 
             <div className="modal-actions" style={{ marginTop: "1rem" }}>
               <button type="button" className="ghost" onClick={() => setSettingsOpen(false)}>
@@ -846,5 +711,7 @@ export default function App() {
         </div>
       )}
     </div>
+      )}
+    </>
   );
 }

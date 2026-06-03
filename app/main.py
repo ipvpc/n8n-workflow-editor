@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import database, multi_config, settings_store
+from . import database, multi_config, settings_store, workflow_sync
 from .ai_chat import ChatRequest, ai_status, run_chat
 from .n8n_client import N8nClientError, client_from_resolved, close_shared_clients
 
@@ -142,13 +142,14 @@ def health():
     return {
         "status": "ok",
         "service": "n8n-workflow-editor",
-        "database": multi_config.db_enabled(),
+        "database": True,
+        "multi_instance": True,
     }
 
 
 @app.get("/api/capabilities")
 def capabilities():
-    return {"database": multi_config.db_enabled()}
+    return {"database": True, "multi_instance": True}
 
 
 class N8nSettingsPublic(BaseModel):
@@ -162,37 +163,17 @@ class N8nSettingsPublic(BaseModel):
 
 @app.get("/api/settings/n8n", response_model=N8nSettingsPublic)
 async def get_n8n_settings():
-    if multi_config.db_enabled():
-        try:
-            r = await multi_config.resolve_active_n8n()
-        except ValueError:
-            return N8nSettingsPublic(source="database")
-        return N8nSettingsPublic(
-            base_url=r.base_url,
-            api_key_masked=settings_store.mask_api_key(r.api_key),
-            has_api_key=bool(r.api_key),
-            source="database",
-            instance_id=str(r.instance_id) if r.instance_id else None,
-            instance_name=r.instance_name,
-        )
-
-    f = settings_store.load_settings()
-    base_env = settings_store._env_base_url()  # noqa: SLF001
-    key_env = settings_store._env_api_key()  # noqa: SLF001
-
-    if f:
-        pub = f.model_dump_public()
-        return N8nSettingsPublic(
-            base_url=pub.get("base_url") or base_env or None,
-            api_key_masked=pub.get("api_key_masked"),
-            has_api_key=bool(f.api_key) or bool(key_env),
-            source="file" if f.base_url or f.api_key else "env",
-        )
+    try:
+        r = await multi_config.resolve_active_n8n()
+    except ValueError:
+        return N8nSettingsPublic(source="database")
     return N8nSettingsPublic(
-        base_url=base_env or None,
-        api_key_masked=settings_store.mask_api_key(key_env) if key_env else None,
-        has_api_key=bool(key_env),
-        source="env",
+        base_url=r.base_url,
+        api_key_masked=settings_store.mask_api_key(r.api_key),
+        has_api_key=bool(r.api_key),
+        source="database",
+        instance_id=str(r.instance_id) if r.instance_id else None,
+        instance_name=r.instance_name,
     )
 
 
@@ -208,73 +189,48 @@ async def put_n8n_settings(body: PutN8nSettingsBody):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    if multi_config.db_enabled():
-        new_key = (body.api_key or "").strip()
-        try:
-            cur = await multi_config.resolve_active_n8n()
-            iid = cur.instance_id
-        except ValueError:
-            iid = None
-        if iid:
-            await multi_config.update_n8n_instance(
-                iid,
-                base_url=base,
-                api_key=new_key or None,
-            )
-            return {"ok": True, "source": "database", "instance_id": str(iid)}
-        if not new_key:
-            raise HTTPException(
-                status_code=400,
-                detail="api_key is required when no active n8n instance exists yet",
-            )
-        host = urlparse(base).netloc or "n8n"
-        nid = await multi_config.create_n8n_instance(
-            name=host,
-            base_url=base,
-            api_key=new_key,
-        )
-        prefs = await multi_config.get_preferences()
-        llm_raw = prefs.get("active_llm_profile_id")
-        await multi_config.set_preferences(
-            nid,
-            UUID(llm_raw) if llm_raw else None,
-        )
-        return {"ok": True, "source": "database", "instance_id": str(nid)}
-
-    prev = settings_store.load_settings()
     new_key = (body.api_key or "").strip()
-    if new_key:
-        api_key = new_key
-    elif prev and prev.api_key:
-        api_key = prev.api_key
-    else:
-        api_key = settings_store._env_api_key()  # noqa: SLF001
-
-    if not api_key:
+    try:
+        cur = await multi_config.resolve_active_n8n()
+        iid = cur.instance_id
+    except ValueError:
+        iid = None
+    if iid:
+        await multi_config.update_n8n_instance(
+            iid,
+            base_url=base,
+            api_key=new_key or None,
+        )
+        return {"ok": True, "source": "database", "instance_id": str(iid)}
+    if not new_key:
         raise HTTPException(
             status_code=400,
-            detail="api_key is required (or set N8N_API_KEY in environment) when none is stored",
+            detail="api_key is required when no active n8n instance exists yet",
         )
-
-    st = settings_store.N8nConnectionSettings(base_url=base, api_key=api_key)
-    settings_store.save_settings(st)
-    pub = st.model_dump_public()
-    return {"ok": True, **pub, "source": "file"}
+    host = urlparse(base).netloc or "n8n"
+    nid = await multi_config.create_n8n_instance(
+        name=host,
+        base_url=base,
+        api_key=new_key,
+    )
+    prefs = await multi_config.get_preferences()
+    llm_raw = prefs.get("active_llm_profile_id")
+    await multi_config.set_preferences(
+        nid,
+        UUID(llm_raw) if llm_raw else None,
+    )
+    return {"ok": True, "source": "database", "instance_id": str(nid)}
 
 
 @app.delete("/api/settings/n8n")
 async def delete_n8n_settings():
-    if multi_config.db_enabled():
-        prefs = await multi_config.get_preferences()
-        llm_raw = prefs.get("active_llm_profile_id")
-        await multi_config.set_preferences(
-            None,
-            UUID(llm_raw) if llm_raw else None,
-        )
-        return {"ok": True, "cleared_active_n8n": True}
-
-    removed = settings_store.delete_settings_file()
-    return {"ok": True, "removed_file": removed}
+    prefs = await multi_config.get_preferences()
+    llm_raw = prefs.get("active_llm_profile_id")
+    await multi_config.set_preferences(
+        None,
+        UUID(llm_raw) if llm_raw else None,
+    )
+    return {"ok": True, "cleared_active_n8n": True}
 
 
 @app.post("/api/n8n/test")
@@ -348,6 +304,122 @@ async def api_delete_workflow(workflow_id: str):
         raise _upstream_error("/api/workflows/{workflow_id}", e) from e
 
 
+# --- Local workflow cache, sync, and backups ---
+
+
+@app.get("/api/workflows/local")
+async def api_list_local_workflows():
+    _require_db()
+    try:
+        return await workflow_sync.list_local_workflows()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.get("/api/workflows/local/{workflow_id}")
+async def api_get_local_workflow(workflow_id: str):
+    _require_db()
+    try:
+        return await workflow_sync.get_local_workflow(workflow_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@app.put("/api/workflows/local/{workflow_id}")
+async def api_put_local_workflow(workflow_id: str, body: dict[str, Any]):
+    _require_db()
+    try:
+        return await workflow_sync.save_local_workflow(workflow_id, body)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+class SyncQuery(BaseModel):
+    force: bool = False
+
+
+@app.post("/api/workflows/sync")
+async def api_sync_all_workflows(force: bool = False):
+    _require_db()
+    try:
+        stats = await workflow_sync.sync_all_from_remote(force=force)
+        return {"ok": True, **stats}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except N8nClientError as e:
+        raise _upstream_error("/api/workflows/sync", e) from e
+
+
+@app.post("/api/workflows/local/{workflow_id}/pull")
+async def api_pull_workflow(workflow_id: str, force: bool = False):
+    _require_db()
+    try:
+        return await workflow_sync.sync_one_from_remote(workflow_id, force=force)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except N8nClientError as e:
+        raise _upstream_error(f"/api/workflows/local/{workflow_id}/pull", e) from e
+
+
+@app.post("/api/workflows/local/{workflow_id}/push")
+async def api_push_workflow(workflow_id: str):
+    _require_db()
+    try:
+        return await workflow_sync.push_to_remote(workflow_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except N8nClientError as e:
+        raise _upstream_error(f"/api/workflows/local/{workflow_id}/push", e) from e
+
+
+class BackupCreateBody(BaseModel):
+    label: str | None = None
+
+
+@app.post("/api/workflows/local/{workflow_id}/backups")
+async def api_create_backup(workflow_id: str, body: BackupCreateBody | None = None):
+    _require_db()
+    try:
+        label = body.label if body else None
+        return await workflow_sync.create_backup(workflow_id, label=label)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@app.get("/api/workflows/local/{workflow_id}/backups")
+async def api_list_backups(workflow_id: str):
+    _require_db()
+    try:
+        return await workflow_sync.list_backups(workflow_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+@app.get("/api/workflows/local/{workflow_id}/backups/{backup_id}")
+async def api_get_backup(workflow_id: str, backup_id: UUID):
+    _require_db()
+    try:
+        return await workflow_sync.get_backup(workflow_id, backup_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+
+class RestoreBackupBody(BaseModel):
+    push: bool = False
+
+
+@app.post("/api/workflows/local/{workflow_id}/backups/{backup_id}/restore")
+async def api_restore_backup(workflow_id: str, backup_id: UUID, body: RestoreBackupBody | None = None):
+    _require_db()
+    push = bool(body.push) if body else False
+    try:
+        return await workflow_sync.restore_backup(workflow_id, backup_id, push=push)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except N8nClientError as e:
+        raise _upstream_error(f"/api/workflows/local/{workflow_id}/backups/{backup_id}/restore", e) from e
+
+
 @app.get("/api/ai/status")
 async def api_ai_status():
     return await ai_status()
@@ -369,7 +441,7 @@ async def api_chat(req: ChatRequest):
 
 def _require_db():
     if not multi_config.db_enabled():
-        raise HTTPException(status_code=501, detail="DATABASE_URL is not configured")
+        raise HTTPException(status_code=503, detail="PostgreSQL is not available")
 
 
 class N8nInstanceCreateBody(BaseModel):

@@ -1,4 +1,4 @@
-"""Async PostgreSQL pool (optional; enabled when DATABASE_URL is set)."""
+"""Async PostgreSQL pool (required; multi-instance mode)."""
 
 from __future__ import annotations
 
@@ -22,8 +22,9 @@ async def init_db() -> None:
     global _pool
     url = database_url()
     if not url:
-        _pool = None
-        return
+        raise RuntimeError(
+            "DATABASE_URL is required. Multi-instance mode stores n8n and LLM profiles in PostgreSQL.",
+        )
     _pool = await asyncpg.create_pool(url, min_size=1, max_size=10)
     async with _pool.acquire() as conn:
         await _ensure_schema(conn)
@@ -86,6 +87,37 @@ async def _ensure_schema(conn: asyncpg.Connection) -> None:
         INSERT INTO app_prefs (id)
         SELECT 1
         WHERE NOT EXISTS (SELECT 1 FROM app_prefs WHERE id = 1);
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_copy (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            n8n_instance_id UUID NOT NULL REFERENCES n8n_instance(id) ON DELETE CASCADE,
+            remote_workflow_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            active BOOLEAN,
+            workflow_json JSONB NOT NULL,
+            remote_updated_at TIMESTAMPTZ,
+            synced_at TIMESTAMPTZ,
+            local_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            is_dirty BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (n8n_instance_id, remote_workflow_id)
+        );
+        """
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_backup (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            workflow_copy_id UUID NOT NULL REFERENCES workflow_copy(id) ON DELETE CASCADE,
+            name TEXT,
+            label TEXT,
+            workflow_json JSONB NOT NULL,
+            source TEXT NOT NULL DEFAULT 'manual',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
         """
     )
 

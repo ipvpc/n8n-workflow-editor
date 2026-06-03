@@ -66,91 +66,57 @@ def _is_production() -> bool:
 
 async def resolve_active_n8n() -> ResolvedN8n:
     pool = get_pool()
-    if pool:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT i.id, i.name, i.base_url, i.api_key, i.http_timeout_seconds, i.skip_tls_verify
-                FROM app_prefs p
-                LEFT JOIN n8n_instance i ON i.id = p.active_n8n_instance_id
-                WHERE p.id = 1;
-                """
-            )
-            if row and row["base_url"] and row["api_key"]:
-                if _is_production() and bool(row["skip_tls_verify"]):
-                    raise ValueError("skip_tls_verify=true is not allowed in production")
-                return ResolvedN8n(
-                    str(row["base_url"]).rstrip("/"),
-                    str(row["api_key"]),
-                    float(row["http_timeout_seconds"] or 60),
-                    bool(row["skip_tls_verify"]),
-                    instance_id=row["id"],
-                    instance_name=str(row["name"]) if row["name"] is not None else None,
-                )
-        base = os.environ.get("N8N_BASE_URL", "").strip().rstrip("/")
-        key = os.environ.get("N8N_API_KEY", "").strip()
-        if base and key:
-            skip = _env_skip_tls()
-            if _is_production() and skip:
-                raise ValueError("N8N_SKIP_TLS_VERIFY=true is not allowed in production")
-            return ResolvedN8n(base, key, _env_timeout(), skip, None, None)
-        raise ValueError("No active n8n instance and N8N_BASE_URL / N8N_API_KEY are not set")
+    if not pool:
+        raise ValueError("DATABASE_URL is not configured")
 
-    base, key = settings_store.resolved_connection()
-    if not base or not key:
-        raise ValueError("n8n base URL and API key must be configured")
-    skip = _env_skip_tls()
-    if _is_production() and skip:
-        raise ValueError("N8N_SKIP_TLS_VERIFY=true is not allowed in production")
-    return ResolvedN8n(base, key, _env_timeout(), skip, None, None)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT i.id, i.name, i.base_url, i.api_key, i.http_timeout_seconds, i.skip_tls_verify
+            FROM app_prefs p
+            LEFT JOIN n8n_instance i ON i.id = p.active_n8n_instance_id
+            WHERE p.id = 1;
+            """
+        )
+        if row and row["base_url"] and row["api_key"]:
+            if _is_production() and bool(row["skip_tls_verify"]):
+                raise ValueError("skip_tls_verify=true is not allowed in production")
+            return ResolvedN8n(
+                str(row["base_url"]).rstrip("/"),
+                str(row["api_key"]),
+                float(row["http_timeout_seconds"] or 60),
+                bool(row["skip_tls_verify"]),
+                instance_id=row["id"],
+                instance_name=str(row["name"]) if row["name"] is not None else None,
+            )
+
+    base = os.environ.get("N8N_BASE_URL", "").strip().rstrip("/")
+    key = os.environ.get("N8N_API_KEY", "").strip()
+    if base and key:
+        skip = _env_skip_tls()
+        if _is_production() and skip:
+            raise ValueError("N8N_SKIP_TLS_VERIFY=true is not allowed in production")
+        return ResolvedN8n(base, key, _env_timeout(), skip, None, None)
+    raise ValueError("No active n8n instance. Add one on the Connections page.")
 
 
 async def resolve_active_llm() -> ResolvedLlm | None:
     pool = get_pool()
-    if pool:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT l.provider, l.config
-                FROM app_prefs p
-                JOIN llm_profile l ON l.id = p.active_llm_profile_id
-                WHERE p.id = 1;
-                """
-            )
-            if row:
-                return _row_to_resolved_llm(str(row["provider"]), row["config"])
+    if not pool:
         return None
 
-    from .llm_env import llm_config_from_env
-
-    provider, cfg = llm_config_from_env()
-    if provider == "none":
-        return None
-    if provider == "azure_openai":
-        c = cfg
-        return ResolvedLlm(
-            "azure_openai",
-            str(c.get("azure_endpoint", "")),
-            str(c.get("api_key", "")),
-            str(c.get("api_version", "2024-08-01-preview")),
-            str(c.get("azure_deployment", "")),
-            None,
-            None,
-            float(os.environ.get("N8N_EDITOR_AI_TEMPERATURE", "0.2")),
-            int(os.environ.get("N8N_EDITOR_AI_MAX_TOKENS", "4096")),
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT l.provider, l.config
+            FROM app_prefs p
+            JOIN llm_profile l ON l.id = p.active_llm_profile_id
+            WHERE p.id = 1;
+            """
         )
-    c = cfg
-    return ResolvedLlm(
-        "openai_compatible",
-        None,
-        str(c.get("api_key", "")),
-        None,
-        None,
-        str(c.get("base_url", "https://api.openai.com/v1/")).rstrip("/") + "/",
-        os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",
-        float(os.environ.get("N8N_EDITOR_AI_TEMPERATURE", "0.2")),
-        int(os.environ.get("N8N_EDITOR_AI_MAX_TOKENS", "4096")),
-    )
+        if row:
+            return _row_to_resolved_llm(str(row["provider"]), row["config"])
+    return None
 
 
 def _row_to_resolved_llm(provider: str, config: Any) -> ResolvedLlm:

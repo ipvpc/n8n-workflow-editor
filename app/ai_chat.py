@@ -9,7 +9,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from . import multi_config
-from .llm_env import ai_status_from_env
 from .n8n_knowledge import N8N_KNOWLEDGE_PACK
 from .n8n_client import N8nClientError, client_from_resolved
 
@@ -34,9 +33,7 @@ class ChatRequest(BaseModel):
 
 
 async def ai_status() -> dict[str, Any]:
-    if multi_config.db_enabled():
-        return await multi_config.ai_status_from_db()
-    return ai_status_from_env()
+    return await multi_config.ai_status_from_db()
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -168,8 +165,7 @@ async def run_chat(req: ChatRequest) -> dict[str, Any]:
     llm = await multi_config.resolve_active_llm()
     if not llm:
         raise RuntimeError(
-            "AI is not configured. With PostgreSQL enabled, create an LLM profile and set it active. "
-            "Otherwise set AZURE_OPENAI_* or OPENAI_API_KEY in the environment."
+            "AI is not configured. Create an LLM profile on the Settings page and set it active."
         )
 
     from openai import AsyncAzureOpenAI, AsyncOpenAI
