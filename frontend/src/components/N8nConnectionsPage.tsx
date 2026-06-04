@@ -1,11 +1,38 @@
 import { useCallback, useEffect, useState } from "react";
 import { requestJson } from "../lib/api";
-import type { N8nInstanceRow, Preferences } from "../types";
+import type { N8nAccessVerification, N8nInstanceRow, Preferences } from "../types";
 
 type Props = {
   onBack: () => void;
   onChanged: () => void;
 };
+
+function formatAccessVerification(result: N8nAccessVerification): string {
+  if (result.ok) return "Read and write access verified.";
+  const parts: string[] = [];
+  if (result.read) parts.push("read OK");
+  else parts.push(`read failed${result.read_error ? `: ${result.read_error}` : ""}`);
+  if (result.write) parts.push("write OK");
+  else parts.push(`write failed${result.write_error ? `: ${result.write_error}` : ""}`);
+  return parts.join(" · ");
+}
+
+function buildTestPayload(
+  editingId: string | null,
+  baseUrl: string,
+  apiKey: string,
+  timeout: number,
+  skipTls: boolean,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    base_url: baseUrl.trim(),
+    http_timeout_seconds: timeout,
+    skip_tls_verify: skipTls,
+  };
+  if (apiKey.trim()) payload.api_key = apiKey.trim();
+  if (editingId) payload.instance_id = editingId;
+  return payload;
+}
 
 export function N8nConnectionsPage({ onBack, onChanged }: Props) {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
@@ -46,12 +73,60 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
     void loadData().catch((e) => setStatusMsg(String(e)));
   }, [loadData]);
 
+  const verifyConnection = async (
+    payload: Record<string, unknown>,
+    instanceId?: string,
+  ): Promise<N8nAccessVerification> => {
+    const url = instanceId
+      ? `/api/n8n-instances/${encodeURIComponent(instanceId)}/test`
+      : "/api/n8n/test";
+    return requestJson<N8nAccessVerification>(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  };
+
+  const testFormConnection = async () => {
+    if (!baseUrl.trim()) {
+      setStatusMsg("Base URL is required to test the connection.");
+      return;
+    }
+    if (!editingId && !apiKey.trim()) {
+      setStatusMsg("API key is required to test a new instance.");
+      return;
+    }
+    setStatusMsg(null);
+    setBusy(true);
+    try {
+      const result = await verifyConnection(buildTestPayload(editingId, baseUrl, apiKey, timeout, skipTls));
+      setStatusMsg(formatAccessVerification(result));
+    } catch (e) {
+      setStatusMsg(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const testConnection = async () => {
     setStatusMsg(null);
     setBusy(true);
     try {
-      await requestJson<{ ok: boolean }>("/api/n8n/test", { method: "POST" });
-      setStatusMsg("Connection successful.");
+      const result = await verifyConnection({});
+      setStatusMsg(formatAccessVerification(result));
+    } catch (e) {
+      setStatusMsg(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const testSavedInstance = async (instance: N8nInstanceRow) => {
+    setStatusMsg(null);
+    setBusy(true);
+    try {
+      const result = await verifyConnection({}, instance.id);
+      setStatusMsg(`${instance.name}: ${formatAccessVerification(result)}`);
     } catch (e) {
       setStatusMsg(String(e));
     } finally {
@@ -96,10 +171,14 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
+        const verify = await verifyConnection(
+          buildTestPayload(editingId, baseUrl, apiKey, timeout, skipTls),
+          editingId,
+        );
         resetForm();
         await loadData();
         onChanged();
-        setStatusMsg("Instance updated.");
+        setStatusMsg(`Instance updated. ${formatAccessVerification(verify)}`);
         return;
       }
 
@@ -116,10 +195,11 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
           active_llm_profile_id: prefs?.active_llm_profile_id ?? null,
         }),
       });
+      const verify = await verifyConnection({}, created.id);
       resetForm();
       await loadData();
       onChanged();
-      setStatusMsg("Instance added and set as active.");
+      setStatusMsg(`Instance added and set as active. ${formatAccessVerification(verify)}`);
     } catch (e) {
       setStatusMsg(String(e));
     } finally {
@@ -206,6 +286,11 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
                       {editing && <span className="badge">Editing</span>}
                     </div>
                     <div className="instance-card-actions">
+                      {!editing && (
+                        <button type="button" className="ghost" disabled={busy} onClick={() => void testSavedInstance(x)}>
+                          Test
+                        </button>
+                      )}
                       {!editing && (
                         <button type="button" className="ghost" disabled={busy} onClick={() => startEdit(x)}>
                           Edit
@@ -294,6 +379,9 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
           </div>
 
           <div className="connections-form-actions">
+            <button type="button" className="ghost" disabled={busy} onClick={() => void testFormConnection()}>
+              Test connection
+            </button>
             <button type="button" className="primary" disabled={busy} onClick={() => void saveInstance()}>
               {editingId ? "Save changes" : "Add instance"}
             </button>
@@ -310,8 +398,8 @@ export function N8nConnectionsPage({ onBack, onChanged }: Props) {
           <ol className="help-list">
             <li>Open your n8n instance in the browser.</li>
             <li>Go to <strong>Settings → n8n API</strong>.</li>
-            <li>Create an API key with access to workflows.</li>
-            <li>Paste the base URL and key here, then test the connection.</li>
+            <li>Create an API key with workflow read and write permissions.</li>
+            <li>Paste the base URL and key here, then test the connection before saving.</li>
           </ol>
         </section>
       </div>

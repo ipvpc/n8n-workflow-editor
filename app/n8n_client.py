@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
@@ -108,6 +109,61 @@ class N8nClient:
     async def health_ping(self) -> dict[str, Any]:
         """Minimal call to verify auth (list with limit 1)."""
         return await self._request("GET", "/workflows", params={"limit": 1})
+
+    async def verify_access(self) -> dict[str, Any]:
+        """Verify API key can list workflows (read) and create/delete a probe workflow (write)."""
+        result: dict[str, Any] = {
+            "ok": False,
+            "read": False,
+            "write": False,
+            "read_error": None,
+            "write_error": None,
+        }
+
+        try:
+            await self._request("GET", "/workflows", params={"limit": 1})
+            result["read"] = True
+        except N8nClientError as e:
+            result["read_error"] = str(e)
+            return result
+
+        probe_id: str | None = None
+        try:
+            created = await self.create_workflow(
+                {
+                    "name": f"__n8n_workflow_editor_access_probe__{uuid4().hex[:12]}",
+                    "nodes": [
+                        {
+                            "id": str(uuid4()),
+                            "name": "Manual Trigger",
+                            "type": "n8n-nodes-base.manualTrigger",
+                            "typeVersion": 1,
+                            "position": [0, 0],
+                            "parameters": {},
+                        }
+                    ],
+                    "connections": {},
+                    "settings": {"executionOrder": "v1"},
+                }
+            )
+            if isinstance(created, dict) and created.get("id") is not None:
+                probe_id = str(created["id"])
+            result["write"] = True
+        except N8nClientError as e:
+            result["write_error"] = str(e)
+        finally:
+            if probe_id:
+                try:
+                    await self.delete_workflow(probe_id)
+                except N8nClientError as e:
+                    logger.warning("failed to delete access probe workflow %s: %s", probe_id, e)
+                    cleanup = f"cleanup failed: {e}"
+                    result["write_error"] = (
+                        f"{result['write_error']}; {cleanup}" if result["write_error"] else cleanup
+                    )
+
+        result["ok"] = bool(result["read"] and result["write"])
+        return result
 
     async def list_workflows(
         self,

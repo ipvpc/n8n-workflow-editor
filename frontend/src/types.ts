@@ -33,6 +33,14 @@ export type N8nInstanceRow = {
   skip_tls_verify: boolean;
 };
 
+export type N8nAccessVerification = {
+  ok: boolean;
+  read: boolean;
+  write: boolean;
+  read_error?: string | null;
+  write_error?: string | null;
+};
+
 export type Preferences = {
   active_n8n_instance_id: string | null;
   active_llm_profile_id: string | null;

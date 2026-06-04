@@ -137,6 +137,42 @@ async def _get_client():
         raise HTTPException(status_code=503, detail=str(e)) from e
 
 
+async def _client_for_n8n_test(
+    *,
+    instance_id: UUID | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    http_timeout_seconds: float | None = None,
+    skip_tls_verify: bool | None = None,
+):
+    if instance_id is not None:
+        _require_db()
+        creds = await multi_config.get_n8n_instance_credentials(instance_id)
+        bu = settings_store.validate_base_url(base_url) if base_url is not None else creds["base_url"]
+        ak = api_key.strip() if api_key and api_key.strip() else creds["api_key"]
+        to = http_timeout_seconds if http_timeout_seconds is not None else creds["http_timeout_seconds"]
+        sk = skip_tls_verify if skip_tls_verify is not None else creds["skip_tls_verify"]
+    elif base_url is not None:
+        if not (api_key or "").strip():
+            raise HTTPException(status_code=400, detail="api_key is required when testing ad-hoc credentials")
+        bu = settings_store.validate_base_url(base_url)
+        ak = api_key.strip()
+        to = http_timeout_seconds if http_timeout_seconds is not None else 60.0
+        sk = bool(skip_tls_verify)
+    else:
+        return await _get_client()
+
+    try:
+        return client_from_resolved(
+            bu,
+            ak,
+            http_timeout_seconds=to,
+            skip_tls_verify=sk,
+        )
+    except N8nClientError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
 @app.get("/api/health")
 def health():
     return {
@@ -233,16 +269,51 @@ async def delete_n8n_settings():
     return {"ok": True, "cleared_active_n8n": True}
 
 
+class N8nTestBody(BaseModel):
+    instance_id: UUID | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    http_timeout_seconds: float | None = Field(default=None, ge=1, le=600)
+    skip_tls_verify: bool | None = None
+
+
 @app.post("/api/n8n/test")
-async def test_n8n():
+async def test_n8n(body: N8nTestBody | None = None):
     try:
-        c = await _get_client()
-        data = await c.health_ping()
-        return {"ok": True, "sample": data}
+        c = await _client_for_n8n_test(
+            instance_id=body.instance_id if body else None,
+            base_url=body.base_url if body else None,
+            api_key=body.api_key if body else None,
+            http_timeout_seconds=body.http_timeout_seconds if body else None,
+            skip_tls_verify=body.skip_tls_verify if body else None,
+        )
+        return await c.verify_access()
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except N8nClientError as e:
         raise _upstream_error("/api/n8n/test", e) from e
+
+
+@app.post("/api/n8n-instances/{instance_id}/test")
+async def test_n8n_instance(instance_id: UUID, body: N8nTestBody | None = None):
+    _require_db()
+    try:
+        c = await _client_for_n8n_test(
+            instance_id=instance_id,
+            base_url=body.base_url if body else None,
+            api_key=body.api_key if body else None,
+            http_timeout_seconds=body.http_timeout_seconds if body else None,
+            skip_tls_verify=body.skip_tls_verify if body else None,
+        )
+        return await c.verify_access()
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404 if "not found" in str(e) else 400, detail=str(e)) from e
+    except N8nClientError as e:
+        raise _upstream_error(f"/api/n8n-instances/{instance_id}/test", e) from e
 
 
 @app.get("/api/workflows")

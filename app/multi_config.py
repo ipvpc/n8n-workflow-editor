@@ -261,6 +261,20 @@ async def update_n8n_instance(
     return True
 
 
+async def get_n8n_instance_credentials(instance_id: UUID) -> dict[str, Any]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM n8n_instance WHERE id = $1", instance_id)
+    if not row:
+        raise ValueError("instance not found")
+    return {
+        "base_url": row["base_url"],
+        "api_key": str(row["api_key"]),
+        "http_timeout_seconds": float(row["http_timeout_seconds"] or 60),
+        "skip_tls_verify": bool(row["skip_tls_verify"]),
+    }
+
+
 async def delete_n8n_instance(instance_id: UUID) -> bool:
     pool = _require_pool()
     async with pool.acquire() as conn:
